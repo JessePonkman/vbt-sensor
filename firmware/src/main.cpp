@@ -48,7 +48,15 @@
 // 200 Hz = 5 ms
 //
 // We start with 100 Hz for the prototype.
-#define SAMPLE_INTERVAL_US 1000000
+#define SAMPLE_INTERVAL_US 10000
+
+// How many packets to skip between Serial debug lines.
+//
+// At 100 Hz, printing every packet costs ~6.2 ms per line at 115200 baud —
+// 62% of the 10 ms budget — and Serial.print() blocks once the UART TX
+// buffer fills, dragging the real sample rate down. Print 1 in N instead.
+// 0 disables serial debug printing entirely.
+#define SERIAL_DEBUG_EVERY 50
 
 
 // ============================================================
@@ -70,6 +78,13 @@ NimBLECharacteristic* pCharacteristic = nullptr;
 // ============================================================
 
 uint32_t sequenceNumber = 0;
+
+// Loop scheduling. File-scope (not `static` inside loop()) so setup() can
+// seed it after its ~2.5s of delay() calls — otherwise the first loop() sees
+// micros() ~= 3,000,000 against a lastSampleTime of 0 and fires a ~300-packet
+// catch-up burst at SAMPLE_INTERVAL_US = 10000 (harmless at the old 1 Hz, but
+// it poisons the very first second of any 100 Hz session).
+uint32_t lastSampleTime = 0;
 
 
 // ============================================================
@@ -468,6 +483,11 @@ void setup() {
     setupBLE();
 
 
+    // Seed the sample scheduler *after* the delay()s above, not at global
+    // construction time — see the comment on lastSampleTime.
+    lastSampleTime = micros();
+
+
     Serial.println();
     Serial.println(
         "======================================"
@@ -477,8 +497,16 @@ void setup() {
         "SYSTEM READY"
     );
 
+    Serial.print(
+        "Sampling frequency: "
+    );
+
+    Serial.print(
+        1000000.0 / SAMPLE_INTERVAL_US
+    );
+
     Serial.println(
-        "Sampling frequency: 100 Hz"
+        " Hz"
     );
 
     Serial.println(
@@ -498,8 +526,6 @@ void setup() {
 // ============================================================
 
 void loop() {
-
-    static uint32_t lastSampleTime = 0;
 
     uint32_t now = micros();
 
@@ -525,12 +551,17 @@ void loop() {
 
 
         // ----------------------------------------------------
-        // Serial debugging
+        // Serial debugging — 1 in SERIAL_DEBUG_EVERY packets only
         // ----------------------------------------------------
 
-        printSerialPacket(
-            packet
-        );
+        if (
+            SERIAL_DEBUG_EVERY &&
+            packet.sequence % SERIAL_DEBUG_EVERY == 0
+        ) {
+            printSerialPacket(
+                packet
+            );
+        }
 
 
         // ----------------------------------------------------

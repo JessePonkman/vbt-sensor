@@ -3,6 +3,7 @@
     "name": "VBT Sensor",
     "slug": "vbt-sensor",
     "version": "1.0.0",
+    "scheme": "vbtsensor",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -31,7 +32,8 @@
           "modes": [],
           "bluetoothAlwaysPermission": false
         }
-      ]
+      ],
+      "expo-router"
     ]
   }
 }
