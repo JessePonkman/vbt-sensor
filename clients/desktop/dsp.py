@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import integrate, signal
 
-from protocol import Sample, delta_us
+from protocol import FLAG_SCHED_LATE, FLAG_SCHED_RESYNC, Sample, delta_us
 
 # ============================================================
 # 5.1 — uniform grid reconstruction
@@ -28,12 +28,24 @@ from protocol import Sample, delta_us
 DT_MAX_S = 0.25
 
 
+# The per-sample channels carried on the grid. Accel is always present;
+# the rest arrive only on v2 packets and stay NaN for v1 data and for CSVs
+# recorded before the v2 switch.
+_CHANNELS = ("ax", "ay", "az", "gx", "gy", "gz", "temp_c")
+
+
 @dataclass
 class Grid:
     t: np.ndarray  # seconds, starts at 0 at the first kept sample
     ax: np.ndarray
     ay: np.ndarray
     az: np.ndarray
+    gx: np.ndarray  # rad/s — all-NaN for v1 data
+    gy: np.ndarray
+    gz: np.ndarray
+    temp_c: np.ndarray  # degrees C — all-NaN for v1 data
+    jitter_us: np.ndarray  # NaN where interpolated: invented samples have no real timing
+    flags: np.ndarray  # int, the firmware's VBT_FLAG_* bitfield; 0 where interpolated
     filled: np.ndarray  # bool — True where the sample was interpolated (a dropped packet)
     fs: float  # estimated sample rate, Hz — from the firmware's own timestamps, not a nominal constant
 
@@ -42,22 +54,33 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
     """Reconstructs the uniform grid the firmware actually sampled on.
 
     The firmware's scheduler (main.cpp: `lastSampleTime += SAMPLE_INTERVAL_US`)
-    accumulates rather than reassigning, so it's drift-free by construction —
-    every timestamp it emits is an exact multiple of the sample interval
-    since boot. The irregular dt a client observes comes entirely from
-    packets lost over BLE, and `sequence` counts those losses exactly. So
-    `k = sequence - sequence[0]` is the exact index into a grid of spacing
-    `1/fs`, and this is what legitimates using fixed-coefficient filters
-    (Butterworth, Savitzky-Golay) and Welch/PSD below — see PLAN.md §5.1.
+    accumulates rather than reassigning, so it's drift-free by construction,
+    and since v2 it transmits that scheduled time directly: every timestamp
+    is an exact multiple of the sample interval since boot. The irregular dt
+    a client observes comes entirely from packets lost over BLE, and
+    `sequence` counts those losses exactly. So `k = sequence - sequence[0]`
+    is the exact index into a grid of spacing `1/fs`, and this is what
+    legitimates using fixed-coefficient filters (Butterworth,
+    Savitzky-Golay) and Welch/PSD below — see PLAN.md §5.1.
+
+    That uniformity is a property of the schedule, not of reality: the read
+    itself still lands a little off its slot. v1 conflated the two by
+    sending `micros()` taken after the I2C transaction, which made the grid
+    claim false. v2 separates them — the scheduled time here, and the
+    measured deviation in `jitter_us`, which `timing_stats()` summarises so
+    the claim can be checked rather than trusted. See firmware/PLAN.md §3.2.
     """
     if len(samples) < 2:
         return None
 
     seq = np.fromiter((s.sequence for s in samples), dtype=np.int64, count=len(samples))
     ts = np.fromiter((s.timestamp for s in samples), dtype=np.int64, count=len(samples))
-    ax = np.fromiter((s.ax for s in samples), dtype=np.float64, count=len(samples))
-    ay = np.fromiter((s.ay for s in samples), dtype=np.float64, count=len(samples))
-    az = np.fromiter((s.az for s in samples), dtype=np.float64, count=len(samples))
+    chan = {
+        name: np.fromiter((getattr(s, name) for s in samples), dtype=np.float64, count=len(samples))
+        for name in _CHANNELS
+    }
+    jitter = np.fromiter((s.jitter_us for s in samples), dtype=np.float64, count=len(samples))
+    flags = np.fromiter((s.flags for s in samples), dtype=np.int64, count=len(samples))
 
     # Defensive: BLE notifications are ordered and de-duplicated by the OS
     # stack, so a repeated/out-of-order sequence shouldn't happen — but if
@@ -66,7 +89,8 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
     _, first_idx = np.unique(seq, return_index=True)
     if len(first_idx) != len(seq):
         first_idx = np.sort(first_idx)
-        seq, ts, ax, ay, az = seq[first_idx], ts[first_idx], ax[first_idx], ay[first_idx], az[first_idx]
+        seq, ts, jitter, flags = seq[first_idx], ts[first_idx], jitter[first_idx], flags[first_idx]
+        chan = {name: v[first_idx] for name, v in chan.items()}
     if len(seq) < 2:
         return None
 
@@ -78,7 +102,8 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
 
     breaks = np.nonzero(dt_s >= DT_MAX_S)[0]  # break i sits between sample i and i+1
     start = int(breaks[-1]) + 1 if len(breaks) > 0 else 0
-    seq, ts, ax, ay, az = seq[start:], ts[start:], ax[start:], ay[start:], az[start:]
+    seq, ts, jitter, flags = seq[start:], ts[start:], jitter[start:], flags[start:]
+    chan = {name: v[start:] for name, v in chan.items()}
     dt_us = dt_us[start:]
     if len(seq) < 2:
         return None
@@ -98,23 +123,31 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
     t = np.arange(n, dtype=np.float64) / fs
 
     filled = np.ones(n, dtype=bool)
-    out_ax = np.empty(n, dtype=np.float64)
-    out_ay = np.empty(n, dtype=np.float64)
-    out_az = np.empty(n, dtype=np.float64)
-
     filled[k] = False
-    out_ax[k] = ax
-    out_ay[k] = ay
-    out_az[k] = az
-
     missing = np.nonzero(filled)[0]
-    if len(missing) > 0:
-        present = np.nonzero(~filled)[0]
-        out_ax[missing] = np.interp(missing, present, out_ax[present])
-        out_ay[missing] = np.interp(missing, present, out_ay[present])
-        out_az[missing] = np.interp(missing, present, out_az[present])
 
-    return Grid(t=t, ax=out_ax, ay=out_ay, az=out_az, filled=filled, fs=fs)
+    out = {}
+    for name, v in chan.items():
+        o = np.full(n, np.nan, dtype=np.float64)
+        o[k] = v
+        # Interpolate from the samples that actually carry a value. For a
+        # channel the packet doesn't have at all — gyro and temperature on
+        # v1 data — nothing is finite, so the whole column stays NaN instead
+        # of being invented. np.interp would happily produce numbers here.
+        real = np.isfinite(o)
+        if len(missing) > 0 and real.any():
+            o[missing] = np.interp(missing, np.nonzero(real)[0], o[real])
+        out[name] = o
+
+    # Timing and flags are diagnostics about a specific transmitted packet.
+    # Interpolating them would be inventing evidence, so dropped slots get
+    # NaN and a zero bitfield, and `filled` says which those are.
+    out_jitter = np.full(n, np.nan, dtype=np.float64)
+    out_jitter[k] = jitter
+    out_flags = np.zeros(n, dtype=np.int64)
+    out_flags[k] = flags
+
+    return Grid(t=t, jitter_us=out_jitter, flags=out_flags, filled=filled, fs=fs, **out)
 
 
 # ============================================================
@@ -451,6 +484,52 @@ def axis_stats(x: np.ndarray) -> AxisStats:
         rms=rms(x),
         peak_to_peak=float(np.max(x) - np.min(x)),
     )
+
+
+@dataclass
+class TimingStats:
+    n: int = 0  # real (non-interpolated) samples the numbers are drawn from
+    median_abs_us: float = 0.0
+    p95_abs_us: float = 0.0
+    max_abs_us: float = 0.0
+    spread_us: float = 0.0  # p95 - p5 of the SIGNED jitter
+    late_fraction: float = 0.0
+    resync_count: int = 0
+
+
+def timing_stats(grid: Grid) -> TimingStats:
+    """Summarises how far the firmware's reads landed from their scheduled
+    slots. This is what makes the uniform grid in `to_grid` an assertion
+    that can be checked instead of one that has to be believed.
+
+    `spread_us` is the number that matters, not the median. A constant
+    offset — the I2C read always finishing ~400 us after its slot — is a
+    pure delay and harmless. It's the variation around it that shows up as
+    timing noise on the grid, proportional to the signal's slope.
+
+    Returns zeros for v1 data, where jitter is NaN and unknowable.
+    """
+    real = ~grid.filled
+    j = grid.jitter_us[real]
+    j = j[np.isfinite(j)]
+    if len(j) == 0:
+        return TimingStats()
+
+    fl = grid.flags[real]
+    return TimingStats(
+        n=len(j),
+        median_abs_us=float(np.median(np.abs(j))),
+        p95_abs_us=float(np.percentile(np.abs(j), 95)),
+        max_abs_us=float(np.max(np.abs(j))),
+        spread_us=float(np.percentile(j, 95) - np.percentile(j, 5)),
+        late_fraction=float(np.mean((fl & FLAG_SCHED_LATE) != 0)),
+        resync_count=int(np.count_nonzero(fl & FLAG_SCHED_RESYNC)),
+    )
+
+
+def gyro_available(grid: Grid) -> bool:
+    """False for v1 captures, where the gyro columns are entirely NaN."""
+    return bool(np.any(np.isfinite(grid.gx)))
 
 
 # ============================================================

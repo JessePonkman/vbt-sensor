@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import queue
 import sys
 import time
@@ -42,7 +43,16 @@ from PySide6.QtWidgets import (
 
 import dsp
 from ble import BleWorker
-from protocol import Sample, delta_us, magnitude, to_hex
+from protocol import (
+    FLAG_ACCEL_CLIPPED,
+    FLAG_GYRO_CLIPPED,
+    FLAG_IMU_READ_FAILED,
+    Sample,
+    delta_us,
+    describe_flags,
+    magnitude,
+    to_hex,
+)
 
 BUFFER_MAXLEN = 6000  # 60s at 100Hz — PLAN.md §6
 VISIBLE_WINDOW_S = 10.0
@@ -77,6 +87,12 @@ class LiveBuffer:
         self.packets = 0
         self.lost = 0
         self.rx_times: Deque[float] = deque(maxlen=4000)
+        # v2 health counters, cumulative over the session rather than over
+        # the rolling window — a clipped sample 40s ago still invalidates
+        # conclusions drawn from the capture.
+        self.clipped = 0
+        self.imu_failed = 0
+        self.tx_dropped = 0
 
     def add(self, sample: Sample) -> int:
         """Appends the sample and returns how many packets were lost
@@ -89,6 +105,16 @@ class LiveBuffer:
         # restarted at 0) — just resync instead of counting it as loss.
         self.last_seq = sample.sequence
         self.packets += 1
+
+        if sample.flags & (FLAG_ACCEL_CLIPPED | FLAG_GYRO_CLIPPED):
+            self.clipped += 1
+        if sample.flags & FLAG_IMU_READ_FAILED:
+            self.imu_failed += 1
+        # Each arriving packet reports the drops since the PREVIOUS arrival,
+        # so these intervals are disjoint and the plain sum is the true
+        # total — no double counting.
+        self.tx_dropped += sample.tx_dropped
+
         self.samples.append(sample)
         self.rx_times.append(sample.rx_at)
         return gap
@@ -105,20 +131,55 @@ class SessionRecorder:
     crash mid-session loses at most the in-flight sample, never the whole
     recording (PLAN.md §6)."""
 
+    COLUMNS = ["seq", "t_us", "ax", "ay", "az", "gx", "gy", "gz", "temp_c", "flags", "tx_dropped", "jitter_us", "rx_at_ms"]
+
     def __init__(self, path: Path):
         self._file = open(path, "w", newline="")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(["seq", "t_us", "ax", "ay", "az", "rx_at_ms"])
+        self._writer.writerow(self.COLUMNS)
 
     def write(self, sample: Sample) -> None:
-        self._writer.writerow([sample.sequence, sample.timestamp, sample.ax, sample.ay, sample.az, sample.rx_at * 1000.0])
+        self._writer.writerow(
+            [
+                sample.sequence,
+                sample.timestamp,
+                sample.ax,
+                sample.ay,
+                sample.az,
+                sample.gx,
+                sample.gy,
+                sample.gz,
+                sample.temp_c,
+                sample.flags,
+                sample.tx_dropped,
+                sample.jitter_us,
+                sample.rx_at * 1000.0,
+            ]
+        )
         self._file.flush()
 
     def close(self) -> None:
         self._file.close()
 
 
+def _csv_float(row: Dict[str, str], key: str) -> float:
+    value = row.get(key)
+    if value is None or value == "":
+        return math.nan
+    return float(value)
+
+
+def _csv_int(row: Dict[str, str], key: str) -> int:
+    value = row.get(key)
+    if value is None or value == "":
+        return 0
+    return int(float(value))
+
+
 def _load_csv(path: Path) -> List[Sample]:
+    """Reads a session CSV. Columns the file doesn't have come back as NaN
+    (or 0 for the counters), so recordings made before the v2 packet still
+    open — they just have no gyro, temperature or timing to show."""
     samples = []
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
@@ -131,6 +192,13 @@ def _load_csv(path: Path) -> List[Sample]:
                     sequence=int(row["seq"]),
                     rx_at=float(row["rx_at_ms"]) / 1000.0,
                     raw=b"",
+                    gx=_csv_float(row, "gx"),
+                    gy=_csv_float(row, "gy"),
+                    gz=_csv_float(row, "gz"),
+                    temp_c=_csv_float(row, "temp_c"),
+                    jitter_us=_csv_float(row, "jitter_us"),
+                    flags=_csv_int(row, "flags"),
+                    tx_dropped=_csv_int(row, "tx_dropped"),
                 )
             )
     return samples
@@ -176,6 +244,7 @@ class MainWindow(QMainWindow):
         self.status_notice: Optional[str] = None
         self._integrity_warning: Optional[str] = None
         self._current_grid: Optional[dsp.Grid] = None
+        self._timing: Optional[dsp.TimingStats] = None
         self._last_stream_ts: Optional[int] = None
 
         self._ble_signals = BleSignals()
@@ -329,6 +398,7 @@ class MainWindow(QMainWindow):
         self._drain_queue()
 
         self._current_grid = dsp.to_grid(list(self.buf.samples)) if len(self.buf.samples) >= 2 else None
+        self._timing = dsp.timing_stats(self._current_grid) if self._current_grid is not None else None
 
         if self._current_grid is not None and len(self._current_grid.filled) > 0:
             frac = float(np.mean(self._current_grid.filled))
@@ -375,6 +445,25 @@ class MainWindow(QMainWindow):
             )
         else:
             line2 = f"{fw_hz:.1f} Hz firmware · {self.buf.packets} pkts · {self.buf.lost} perdidos ({pct_lost:.2f}%)"
+
+        # Timing. The spread, not the median, is what says whether the
+        # uniform grid holds — see dsp.timing_stats.
+        if self._timing is not None and self._timing.n > 0:
+            line2 += f" · jitter p95 {self._timing.p95_abs_us:.0f} µs (spread {self._timing.spread_us:.0f})"
+            if self._timing.resync_count:
+                line2 += f" · {self._timing.resync_count} resync"
+
+        # Health counters, shown only when non-zero: in a clean session all
+        # three stay at 0 and there is nothing worth the screen space.
+        health = []
+        if self.buf.clipped:
+            health.append(f"{self.buf.clipped} clip")
+        if self.buf.imu_failed:
+            health.append(f"{self.buf.imu_failed} fallo I²C")
+        if self.buf.tx_dropped:
+            health.append(f"{self.buf.tx_dropped} descartados en el ESP32")
+        if health:
+            line2 += " · ⚠ " + " · ".join(health)
 
         if self.status_notice:
             line2 += f"   [{self.status_notice}]"
@@ -423,6 +512,14 @@ class MainWindow(QMainWindow):
             f"{sample.sequence:>8d}  dt={dt_str}ms  "
             f"ax={sample.ax:>7.3f} ay={sample.ay:>7.3f} az={sample.az:>7.3f}  |a|={a:>6.3f}"
         )
+        if not math.isnan(sample.gx):
+            line += f"  gx={sample.gx:>7.3f} gy={sample.gy:>7.3f} gz={sample.gz:>7.3f}  T={sample.temp_c:>5.1f}°C"
+        # This is the tab where an I2C glitch or a railed sample is meant to
+        # be caught (PLAN.md §8.4), so the flags go inline rather than in a
+        # counter somewhere else.
+        marks = describe_flags(sample.flags)
+        if marks:
+            line += f"  ⚠[{marks}]"
         if self.hex_check.isChecked() and sample.raw:
             line += f"  [{to_hex(sample.raw)}]"
         return line
@@ -432,15 +529,35 @@ class MainWindow(QMainWindow):
 
     # -- tab 2: Accel ---------------------------------------------------------
 
+    # The gyro panels sit on the same tab and the same X axis as accel:
+    # the point of having them is reading them against each other.
+    ACCEL_TAB_AXES = (
+        ("ax", "Aceleración X (m/s²)"),
+        ("ay", "Aceleración Y (m/s²)"),
+        ("az", "Aceleración Z (m/s²)"),
+        ("gx", "Giro X (rad/s)"),
+        ("gy", "Giro Y (rad/s)"),
+        ("gz", "Giro Z (rad/s)"),
+    )
+    N_ACCEL_AXES = 3
+
     def _build_accel_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
+
+        top = QHBoxLayout()
+        self.gyro_check = QCheckBox("Mostrar giroscopio")
+        self.gyro_check.toggled.connect(self._on_gyro_toggled)
+        top.addWidget(self.gyro_check)
+        top.addStretch()
+        layout.addLayout(top)
+
         self.accel_plots: List[pg.PlotWidget] = []
         self.accel_raw_curves = []
         self.accel_filt_curves = []
         self.accel_regions: List[list] = []
 
-        for label in ["Aceleración X (m/s²)", "Aceleración Y (m/s²)", "Aceleración Z (m/s²)"]:
+        for _key, label in self.ACCEL_TAB_AXES:
             plot = pg.PlotWidget()
             plot.setLabel("left", label)
             plot.setLabel("bottom", "t (s)")
@@ -454,7 +571,13 @@ class MainWindow(QMainWindow):
             self.accel_filt_curves.append(filt_curve)
             self.accel_regions.append([])
             layout.addWidget(plot)
+
+        self._on_gyro_toggled(False)
         return w
+
+    def _on_gyro_toggled(self, checked: bool) -> None:
+        for plot in self.accel_plots[self.N_ACCEL_AXES :]:
+            plot.setVisible(checked)
 
     def _refresh_accel(self) -> None:
         grid = self._current_grid
@@ -465,8 +588,19 @@ class MainWindow(QMainWindow):
         fs = grid.fs
         sl = self._visible_slice(fs, len(grid.t))
 
+        has_gyro = dsp.gyro_available(grid)
+        self.gyro_check.setEnabled(has_gyro)
+        self.gyro_check.setToolTip("" if has_gyro else "Esta captura no trae giroscopio (paquete v1)")
+        show_gyro = has_gyro and self.gyro_check.isChecked()
+        self._on_gyro_toggled(show_gyro)
+
+        n_axes = len(self.ACCEL_TAB_AXES) if show_gyro else self.N_ACCEL_AXES
         for axis_key, plot, raw_curve, filt_curve, regions in zip(
-            ("ax", "ay", "az"), self.accel_plots, self.accel_raw_curves, self.accel_filt_curves, self.accel_regions
+            (key for key, _label in self.ACCEL_TAB_AXES[:n_axes]),
+            self.accel_plots,
+            self.accel_raw_curves,
+            self.accel_filt_curves,
+            self.accel_regions,
         ):
             raw = getattr(grid, axis_key)
             # Filter the FULL buffer, slice only for display — the IIR's
@@ -600,6 +734,7 @@ class MainWindow(QMainWindow):
 
     STAT_FIELDS = ("max", "min", "mean", "median", "std", "rms", "peak_to_peak")
     STAT_LABELS = ("Max", "Min", "Media", "Mediana", "Std", "RMS", "P2P")
+    STAT_ROWS = ("X", "Y", "Z", "|a|", "gX", "gY", "gZ", "|ω|")
 
     def _build_stats_tab(self) -> QWidget:
         w = QWidget()
@@ -621,8 +756,8 @@ class MainWindow(QMainWindow):
         self.stats_table = QTableWidget()
         self.stats_table.setColumnCount(len(columns))
         self.stats_table.setHorizontalHeaderLabels(columns)
-        self.stats_table.setRowCount(4)
-        self.stats_table.setVerticalHeaderLabels(["X", "Y", "Z", "|a|"])
+        self.stats_table.setRowCount(len(self.STAT_ROWS))
+        self.stats_table.setVerticalHeaderLabels(list(self.STAT_ROWS))
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.stats_table)
         return w
@@ -636,15 +771,23 @@ class MainWindow(QMainWindow):
         fs = grid.fs
         sl = self._visible_slice(fs, len(grid.t)) if self.stats_scope_combo.currentData() == "visible" else slice(None)
 
-        raw_ax, raw_ay, raw_az = grid.ax[sl], grid.ay[sl], grid.az[sl]
-        filt_ax = dsp.apply_filter(filter_id, grid.ax, fs, **params)[sl]
-        filt_ay = dsp.apply_filter(filter_id, grid.ay, fs, **params)[sl]
-        filt_az = dsp.apply_filter(filter_id, grid.az, fs, **params)[sl]
-        raw_mag = magnitude(raw_ax, raw_ay, raw_az)
-        filt_mag = magnitude(filt_ax, filt_ay, filt_az)
+        def triple(keys: Tuple[str, str, str]) -> List[Tuple[np.ndarray, np.ndarray]]:
+            raw = [getattr(grid, k)[sl] for k in keys]
+            filt = [dsp.apply_filter(filter_id, getattr(grid, k), fs, **params)[sl] for k in keys]
+            return list(zip(raw, filt)) + [(magnitude(*raw), magnitude(*filt))]
 
-        rows = [(raw_ax, filt_ax), (raw_ay, filt_ay), (raw_az, filt_az), (raw_mag, filt_mag)]
-        for row_idx, (raw_x, filt_x) in enumerate(rows):
+        rows = triple(("ax", "ay", "az"))
+        if dsp.gyro_available(grid):
+            rows += triple(("gx", "gy", "gz"))
+
+        for row_idx in range(len(self.STAT_ROWS)):
+            if row_idx >= len(rows):
+                # v1 capture: no gyro to report. An em dash rather than
+                # zeros or NaN, which both read as measurements.
+                for col in range(self.stats_table.columnCount()):
+                    self.stats_table.setItem(row_idx, col, QTableWidgetItem("—"))
+                continue
+            raw_x, filt_x = rows[row_idx]
             raw_stats = dsp.axis_stats(raw_x)
             filt_stats = dsp.axis_stats(filt_x)
             col = 0
@@ -678,9 +821,12 @@ class MainWindow(QMainWindow):
 
         side.addWidget(QLabel("Eje a analizar (PSD / Winter):"))
         self.filter_axis_combo = QComboBox()
-        self.filter_axis_combo.addItem("Eje X", "ax")
-        self.filter_axis_combo.addItem("Eje Y", "ay")
-        self.filter_axis_combo.addItem("Eje Z", "az")
+        self.filter_axis_combo.addItem("Accel X", "ax")
+        self.filter_axis_combo.addItem("Accel Y", "ay")
+        self.filter_axis_combo.addItem("Accel Z", "az")
+        self.filter_axis_combo.addItem("Giro X", "gx")
+        self.filter_axis_combo.addItem("Giro Y", "gy")
+        self.filter_axis_combo.addItem("Giro Z", "gz")
         self.filter_axis_combo.setCurrentIndex(2)  # Z default -- most mounts land close to vertical; switch if not
         side.addWidget(self.filter_axis_combo)
 
@@ -791,9 +937,20 @@ class MainWindow(QMainWindow):
         fs = grid.fs
         axis_key = self.filter_axis_combo.currentData()
         raw = getattr(grid, axis_key)
-        filt = dsp.apply_filter(filter_id, raw, fs, **params)
 
         self.filter_design_label.setText(self._design_readout(filter_id, fs, params))
+
+        # Welch and the Winter sweep both return silent garbage on NaN
+        # input, so refuse the gyro axes on a v1 capture instead of drawing
+        # an empty plot that looks like a result.
+        if not np.any(np.isfinite(raw)):
+            self.psd_raw_curve.setData([], [])
+            self.psd_filt_curve.setData([], [])
+            self.winter_curve.setData([], [])
+            self.winter_label.setText("Esta captura no trae giroscopio (paquete v1): elegí un eje de aceleración.")
+            return
+
+        filt = dsp.apply_filter(filter_id, raw, fs, **params)
 
         f_raw, pxx_raw = dsp.psd(raw, fs)
         f_filt, pxx_filt = dsp.psd(filt, fs)

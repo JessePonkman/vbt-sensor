@@ -28,10 +28,11 @@ PySide6/bleak, apuntá el venv a una versión más asentada, p. ej. con pyenv:
 .venv/bin/python test_dsp.py
 ```
 
-Corre los 8 asserts de `test_dsp.py` (parser, wraparound de timestamp,
-reconstrucción de grilla, integración, equivalencia con el filtro de
-`vbt.ts`, sanidad del pasa-bajos, sanidad del exportador de C) sin
-necesitar el sensor.
+Corre los asserts de `test_dsp.py` (parsers v1 y v2, despacho por
+versión, wraparound de timestamp, reconstrucción de grilla con y sin
+giroscopio, coherencia entre `timestamp` y `sequence`, estadísticos de
+jitter, integración, equivalencia con el filtro de `vbt.ts`, sanidad del
+pasa-bajos, sanidad del exportador de C) sin necesitar el sensor.
 
 ## Uso
 
@@ -56,6 +57,14 @@ necesitar el sensor.
 - **`get_rssi()`** no existe en bleak 3.x (se removió). El RSSI se
   captura una sola vez, en el momento del scan, desde los datos de
   advertising — no se actualiza en vivo mientras está conectado.
-- El struct del paquete BLE (22 bytes, ver `protocol.py`) es la misma
-  fuente de verdad que `firmware/src/main.cpp` y
-  `clients/mobile/src/protocol.ts`. Si el paquete cambia, cambian los tres.
+- El struct del paquete BLE (ver `protocol.py`) es la misma fuente de
+  verdad que `firmware/src/main.cpp` y `clients/mobile/src/protocol.ts`.
+  Si el paquete cambia, cambian los tres.
+- **Protocolo v2** (42 bytes): agrega giroscopio, temperatura, un byte de
+  flags y el diagnóstico de tiempo (`timestamp` agendado + `jitterUs`).
+  Ver [../../firmware/PLAN.md](../../firmware/PLAN.md). `parse_packet`
+  despacha por el byte de versión y sigue leyendo v1, así que las
+  grabaciones viejas se abren igual — sin giro, temperatura ni jitter,
+  que aparecen como NaN y no como ceros.
+- **El cliente móvil todavía no habla v2** y no recibe nada del firmware
+  actual hasta que `clients/mobile/src/protocol.ts` despache por versión.
