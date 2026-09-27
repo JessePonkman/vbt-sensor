@@ -3,3 +3,8 @@ PySide6>=6.7
 pyqtgraph>=0.13
 numpy>=1.26
 scipy>=1.13
+# Optional, test-only: cross-checks imu.py's hand-written Mahony filter
+# against a well-known reference implementation in test_imu.py. Not
+# imported by app.py/dsp.py/imu.py themselves -- if it's missing, that one
+# test just skips instead of failing (see PLAN-V2.md §12).
+ahrs>=0.4

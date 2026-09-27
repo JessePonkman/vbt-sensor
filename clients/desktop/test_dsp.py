@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from scipy import signal
 
 import dsp
+import imu
 from protocol import (
     FLAG_ACCEL_CLIPPED,
     FLAG_IMU_READ_FAILED,
@@ -320,6 +323,152 @@ def test_exported_c_snippet_dc_gain_sane():
         assert False, "savgol needs lookahead and must not be exportable"
     except ValueError:
         pass
+
+
+# ============================================================
+# PLAN-V2.md additions: P4 (IMU_READ_FAILED as a gap), the v1-safety net
+# for Calibration/imu.py, and sanity checks on the new C exporters.
+# ============================================================
+
+
+def test_grid_treats_imu_read_failed_as_a_gap():
+    # A stale-but-transmitted sample in the middle of an otherwise clean
+    # run: seq/timestamp are real grid slots, but its sensor values are a
+    # repeat (mpu.getEvent() failed) and must be interpolated through
+    # rather than trusted, and marked in `filled` same as a dropped packet.
+    dt_us = 10_000
+    kept_seq = list(range(10))
+    ts = [s * dt_us for s in kept_seq]
+    ax = [float(s) for s in kept_seq]  # linear in seq -> interpolation is checkable exactly
+    gx = [2.0 * s for s in kept_seq]
+    flags = [0] * 10
+    flags[5] = FLAG_IMU_READ_FAILED
+
+    grid = dsp.to_grid(_make_samples(kept_seq, ts, ax=ax, gx=gx, flags=flags))
+    assert grid is not None
+    assert grid.filled[5], "an IMU_READ_FAILED slot must be marked filled"
+    assert not grid.filled[4] and not grid.filled[6]
+    # ax/gx are linear in the index by construction, so interpolating
+    # through the excluded sample must reproduce the true value, not the
+    # stale repeat a naive "trust every transmitted packet" reading would
+    # have kept.
+    assert abs(grid.ax[5] - 5.0) < 1e-9
+    assert abs(grid.gx[5] - 10.0) < 1e-9
+    # The flag itself must still be visible on the grid (for UI marking),
+    # even though the sample's sensor values were discarded.
+    assert grid.flags[5] & FLAG_IMU_READ_FAILED
+
+
+def test_v1_capture_is_safe_for_imu_py():
+    # A v1-shaped capture (no gyro at all) must not make any imu.py
+    # function fabricate zeros or raise -- dsp.calibrate must reject the
+    # gyro/temperature parts gracefully, and imu.py's own functions simply
+    # aren't called with a v1 grid because gyro_available() gates them
+    # (checked in app.py); this locks down the piece that IS shared: the
+    # extended Calibration.
+    dt_us = 10_000
+    kept_seq = list(range(200))
+    ts = [s * dt_us for s in kept_seq]
+    ax = [0.0] * 200
+    ay = [0.0] * 200
+    az = [9.81] * 200
+    grid = dsp.to_grid(_make_samples(kept_seq, ts, ax=ax, ay=ay, az=az))
+    assert grid is not None
+    assert not dsp.gyro_available(grid)
+
+    calib = dsp.calibrate(grid.ax, grid.ay, grid.az, grid.gx, grid.gy, grid.gz, grid.temp_c)
+    assert calib is not None
+    assert np.all(np.isnan(calib.gyro_bias)), "no gyro on this capture -- bias must stay NaN, not 0"
+    assert np.isnan(calib.temp_c)
+    assert np.isnan(calib.sigma_g)
+    # And the accel side of calibration is completely unaffected by the
+    # missing gyro.
+    assert abs(calib.g_mag - 9.81) < 1e-6
+
+
+def test_export_mahony_and_madgwick_c_snippets_are_complete():
+    fs = 100.0
+    q0 = imu.tilt_quat(0.0, 0.0, 9.81)
+
+    mahony_code = dsp.export_mahony_c(fs, kp=1.0, ki=0.05, g_mag=9.81, q0=q0)
+    assert "MAHONY_KP" in mahony_code and "mahony_step_vert" in mahony_code
+    assert "{{" not in mahony_code and "}}" not in mahony_code, "an f-string template brace leaked through unformatted"
+    assert "None" not in mahony_code, "a missing parameter must not silently stringify as 'None'"
+
+    complementary_code = dsp.export_mahony_c(fs, kp=1.0, ki=0.0, g_mag=9.81, q0=q0)
+    assert "Complementario" in complementary_code
+    assert "bias_i[0] +=" not in complementary_code, "Ki=0 must not emit the integral-learning lines"
+
+    madgwick_code = dsp.export_madgwick_c(fs, beta=0.033, g_mag=9.81, q0=q0)
+    assert "MADGWICK_BETA" in madgwick_code and "madgwick_step_vert" in madgwick_code
+
+
+def _c_transliteration_mahony_step_vert(state, gx, gy, gz, ax, ay, az, kp, ki, dt, g_mag):
+    """Independent line-for-line Python transliteration of the C emitted
+    by dsp.export_mahony_c's `mahony_step_vert` (with ki > 0, so the
+    bias_i[] update lines are present) -- NOT calling imu.mahony_step.
+    This is what test_export_mahony_c_matches_imu_mahony_step compares
+    against imu.mahony_step, so a future edit that changes one but not
+    the other fails here instead of only being caught by eye."""
+    q0_, q1_, q2_, q3_ = state["q"]
+    vx = 2.0 * (q1_ * q3_ - q0_ * q2_)
+    vy = 2.0 * (q0_ * q1_ + q2_ * q3_)
+    vz = q0_ * q0_ - q1_ * q1_ - q2_ * q2_ + q3_ * q3_
+
+    n = math.sqrt(ax * ax + ay * ay + az * az)
+    accept = n > 1e-6
+    axn = ayn = azn = 0.0
+    if accept:
+        axn, ayn, azn = ax / n, ay / n, az / n
+
+    if accept:
+        ex = ayn * vz - azn * vy
+        ey = azn * vx - axn * vz
+        ez = axn * vy - ayn * vx
+        state["bias_i"][0] += ki * ex * dt
+        state["bias_i"][1] += ki * ey * dt
+        state["bias_i"][2] += ki * ez * dt
+        gx += kp * ex
+        gy += kp * ey
+        gz += kp * ez
+
+    gx += state["bias_i"][0]
+    gy += state["bias_i"][1]
+    gz += state["bias_i"][2]
+
+    hx, hy, hz = gx * 0.5 * dt, gy * 0.5 * dt, gz * 0.5 * dt
+    q0n = q0_ - q1_ * hx - q2_ * hy - q3_ * hz
+    q1n = q1_ + q0_ * hx + q2_ * hz - q3_ * hy
+    q2n = q2_ + q0_ * hy - q1_ * hz + q3_ * hx
+    q3n = q3_ + q0_ * hz + q1_ * hy - q2_ * hx
+    qn = math.sqrt(q0n * q0n + q1n * q1n + q2n * q2n + q3n * q3n)
+    state["q"] = (q0n / qn, q1n / qn, q2n / qn, q3n / qn)
+
+
+def test_export_mahony_c_matches_imu_mahony_step():
+    # The C snippet's operation sequence should be an exact transliteration
+    # of imu.mahony_step's Ki>0 branch (no rejection, since the reference
+    # C loop above the "if (reject)" lines is unconditional). Comparing an
+    # INDEPENDENT re-transcription of the C (not a call into mahony_step)
+    # against mahony_step's real output is what catches a future edit to
+    # one that isn't mirrored in the other.
+    fs = 100.0
+    dt = 1.0 / fs
+    g = 9.81
+    kp, ki = 1.0, 0.05
+    q0 = (1.0, 0.0, 0.0, 0.0)
+
+    st = imu.MahonyState(q=q0)
+    c_state = {"q": q0, "bias_i": [0.0, 0.0, 0.0]}
+    rng = np.random.default_rng(7)
+    n = 300
+    for _ in range(n):
+        gx, gy, gz = (float(v) for v in rng.normal(0, 0.2, 3))
+        ax, ay, az = 0.0, 0.0, g
+        imu.mahony_step(st, gx, gy, gz, ax, ay, az, dt, kp=kp, ki=ki, g_ref=g, reject=False)
+        _c_transliteration_mahony_step_vert(c_state, gx, gy, gz, ax, ay, az, kp, ki, dt, g)
+
+    assert np.allclose(st.q, c_state["q"], atol=1e-9), "C snippet's arithmetic diverged from imu.mahony_step"
 
 
 def _run_all():

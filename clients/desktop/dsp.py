@@ -6,14 +6,15 @@
 
 from __future__ import annotations
 
+import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import integrate, signal
 
-from protocol import FLAG_SCHED_LATE, FLAG_SCHED_RESYNC, Sample, delta_us
+from protocol import FLAG_IMU_READ_FAILED, FLAG_SCHED_LATE, FLAG_SCHED_RESYNC, Sample, delta_us
 
 # ============================================================
 # 5.1 — uniform grid reconstruction
@@ -48,6 +49,14 @@ class Grid:
     flags: np.ndarray  # int, the firmware's VBT_FLAG_* bitfield; 0 where interpolated
     filled: np.ndarray  # bool — True where the sample was interpolated (a dropped packet)
     fs: float  # estimated sample rate, Hz — from the firmware's own timestamps, not a nominal constant
+    # The kept run's first raw `sequence` value. Grid index k corresponds
+    # to absolute sequence `seq0 + k`. Exposed so a stateful consumer
+    # (imu.OrientationTracker via app.py) can tell what's genuinely NEW
+    # between ticks even though LiveBuffer's deque(maxlen=...) evicts from
+    # the front and to_grid rebuilds from scratch every tick — a raw
+    # array index means a different sample each time, but seq0 + k does
+    # not (PLAN-V2.md §6).
+    seq0: int = 0
 
 
 def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
@@ -124,12 +133,26 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
 
     filled = np.ones(n, dtype=bool)
     filled[k] = False
+
+    # P4 (PLAN-V2.md §5.1): a transmitted packet can still carry stale
+    # sensor values — main.cpp sets IMU_READ_FAILED when mpu.getEvent()
+    # fails but the sensors_event_t structs it reads from keep whatever
+    # they held before, so the packet arrives real (its seq/timestamp are
+    # genuine grid slots) but its ax/ay/az/gx/gy/gz/temp_c are a repeat,
+    # not a new reading. Treat those slots as additional gaps for the
+    # sensor channels — interpolate through them instead of injecting a
+    # false plateau — and mark them in `filled` alongside genuinely
+    # dropped packets, since both are "not a real reading here".
+    imu_failed_mask = (flags & FLAG_IMU_READ_FAILED) != 0
+    failed_idx = k[imu_failed_mask]
+    filled[failed_idx] = True
     missing = np.nonzero(filled)[0]
 
     out = {}
     for name, v in chan.items():
         o = np.full(n, np.nan, dtype=np.float64)
         o[k] = v
+        o[failed_idx] = np.nan  # discard the stale reading before interpolating
         # Interpolate from the samples that actually carry a value. For a
         # channel the packet doesn't have at all — gyro and temperature on
         # v1 data — nothing is finite, so the whole column stays NaN instead
@@ -147,7 +170,7 @@ def to_grid(samples: Sequence[Sample]) -> Optional[Grid]:
     out_flags = np.zeros(n, dtype=np.int64)
     out_flags[k] = flags
 
-    return Grid(t=t, jitter_us=out_jitter, flags=out_flags, filled=filled, fs=fs, **out)
+    return Grid(t=t, jitter_us=out_jitter, flags=out_flags, filled=filled, fs=fs, seq0=int(seq[0]), **out)
 
 
 # ============================================================
@@ -366,17 +389,43 @@ CALIB_G_MIN = 8.5
 CALIB_G_MAX = 11.0
 CALIB_STILL_RMS = 0.12
 
+# PLAN-V2.md §7: a rest capture with the gyro reading anything but near-
+# zero wasn't actually still, no matter how quiet the accelerometer looks
+# — the same 3 deg/s the C4 online re-bias uses (from Fusion's own bias
+# algorithm), applied here to "Capturar reposo" too.
+CALIB_GYRO_STILL_DEG_S = 3.0
+
 
 @dataclass
 class Calibration:
-    bias: np.ndarray  # [bx, by, bz] — the measured rest vector, m/s^2
+    bias: np.ndarray  # [bx, by, bz] — the measured accel rest vector, m/s^2
     g_mag: float
+    # v2 additions (PLAN-V2.md §3.2 C2/C5). NaN/nan-filled when the capture
+    # has no gyro/temperature (v1) — never fabricated as zero, same rule
+    # protocol.Sample already applies to a single sample.
+    gyro_bias: np.ndarray = field(default_factory=lambda: np.full(3, math.nan))  # rad/s
+    temp_c: float = math.nan  # sensor temperature at calibration time
+    sigma_a: float = math.nan  # pooled per-axis accel std at rest, m/s^2 — SHOE's sigma_a
+    sigma_g: float = math.nan  # pooled per-axis gyro std at rest, rad/s — SHOE/ARE's sigma_g
 
 
-def calibrate(ax: np.ndarray, ay: np.ndarray, az: np.ndarray) -> Optional[Calibration]:
+def calibrate(
+    ax: np.ndarray,
+    ay: np.ndarray,
+    az: np.ndarray,
+    gx: Optional[np.ndarray] = None,
+    gy: Optional[np.ndarray] = None,
+    gz: Optional[np.ndarray] = None,
+    temp_c: Optional[np.ndarray] = None,
+) -> Optional[Calibration]:
     """vbt.ts's calibrate(), ported — but keeps the full 3-axis bias rather
     than only its magnitude/unit projection, because this tool needs three
-    independent per-axis velocities, not one vertical one."""
+    independent per-axis velocities, not one vertical one.
+
+    gx/gy/gz/temp_c are optional (None or all-NaN for a v1 capture) so this
+    one function still serves both packet versions. When gyro is present,
+    a third guard applies on top of the original two: the gyro itself has
+    to read near-zero, or the "rest" wasn't a rest (PLAN-V2.md §7)."""
     if len(ax) == 0:
         return None
     bias = np.array([float(np.mean(ax)), float(np.mean(ay)), float(np.mean(az))])
@@ -387,7 +436,24 @@ def calibrate(ax: np.ndarray, ay: np.ndarray, az: np.ndarray) -> Optional[Calibr
     still_rms = float(np.sqrt(np.mean(dx**2 + dy**2 + dz**2)))
     if still_rms > CALIB_STILL_RMS:
         return None
-    return Calibration(bias=bias, g_mag=g_mag)
+    sigma_a = float(np.std(np.concatenate([dx, dy, dz])))
+
+    gyro_bias = np.full(3, math.nan)
+    sigma_g = math.nan
+    have_gyro = gx is not None and len(gx) > 0 and bool(np.all(np.isfinite(gx)))
+    if have_gyro:
+        gyro_bias = np.array([float(np.mean(gx)), float(np.mean(gy)), float(np.mean(gz))])
+        gyro_still_deg_s = math.degrees(float(np.linalg.norm(gyro_bias)))
+        if gyro_still_deg_s >= CALIB_GYRO_STILL_DEG_S:
+            return None  # gyro says this wasn't actually still
+        gdx, gdy, gdz = gx - gyro_bias[0], gy - gyro_bias[1], gz - gyro_bias[2]
+        sigma_g = float(np.std(np.concatenate([gdx, gdy, gdz])))
+
+    t_cal = math.nan
+    if temp_c is not None and len(temp_c) > 0 and bool(np.all(np.isfinite(temp_c))):
+        t_cal = float(np.mean(temp_c))
+
+    return Calibration(bias=bias, g_mag=g_mag, gyro_bias=gyro_bias, temp_c=t_cal, sigma_a=sigma_a, sigma_g=sigma_g)
 
 
 def project_vertical(ax: np.ndarray, ay: np.ndarray, az: np.ndarray, calib: Calibration) -> np.ndarray:
@@ -415,6 +481,37 @@ def detrend_linear(t: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, float]:
     bias = v[-1] / span
     corrected = v - bias * (t - t[0])
     return corrected, float(bias)
+
+
+def detrend_segments(t: np.ndarray, v: np.ndarray, rest_intervals: Sequence[Tuple[int, int]]) -> np.ndarray:
+    """I4 (PLAN-V2.md §5.5): the same exact-inverse reasoning as
+    detrend_linear, applied per movement segment instead of over the
+    whole window. Between two detected rest intervals, re-zero to
+    v(t_a) = 0 and subtract the ramp that would bring v(t_b) back to 0 —
+    detrend_linear is the single-segment special case of this.
+
+    Unlike apply_zupt's hard clamp, this leaves velocity CONTINUOUS across
+    the seams (no discontinuity at a rest boundary), at the cost of being
+    non-causal within a segment: it needs to see where the segment ends
+    before it can correct its start. `rest_intervals` come from
+    imu.find_rest_intervals() over whichever detector (Z1/Z2/Z3) is
+    selected."""
+    out = v.astype(np.float64, copy=True)
+    if len(rest_intervals) < 2:
+        return out
+    for k in range(len(rest_intervals) - 1):
+        _, ea = rest_intervals[k]
+        sb, _ = rest_intervals[k + 1]
+        if sb <= ea:
+            continue
+        seg_t = t[ea : sb + 1]
+        seg_v = v[ea : sb + 1] - v[ea]  # re-zero to v(t_a) = 0 for this segment
+        span = seg_t[-1] - seg_t[0]
+        if span > 0:
+            bias = seg_v[-1] / span
+            seg_v = seg_v - bias * (seg_t - seg_t[0])
+        out[ea : sb + 1] = seg_v
+    return out
 
 
 def rms(x: np.ndarray) -> float:
@@ -453,6 +550,26 @@ def apply_zupt(
     out = v.astype(np.float64, copy=True)
     out[still & (np.abs(out) < v_max)] = 0.0
     return out
+
+
+def apply_zupt_mask(v: np.ndarray, rest_mask: np.ndarray, v_max: float = 0.3) -> np.ndarray:
+    """Same clamp as apply_zupt, but taking an externally computed rest
+    mask instead of deriving one from |a| RMS internally — the hook that
+    lets the Velocity tab's rest-detector selector (Z1/Z2/Z3, PLAN-V2.md
+    §5.5/§7) drive the SAME zero-velocity-update action apply_zupt always
+    performed. apply_zupt(...) is Z1's specific case of this."""
+    out = v.astype(np.float64, copy=True)
+    out[rest_mask & (np.abs(out) < v_max)] = 0.0
+    return out
+
+
+def rolling_rms_rest_mask(a_filtered: np.ndarray, fs: float, window_ms: float = 300.0, acc_rms_thresh: float = 0.15) -> np.ndarray:
+    """Z1's rest mask on its own (no v_max guard) — exposed so the
+    Velocity tab's detector selector can treat Z1 uniformly alongside
+    Z2 (imu.are)/Z3 (imu.shoe) for feeding I4/C4/O6, all of which need a
+    plain rest mask rather than apply_zupt's already-clamped output."""
+    window = max(1, int(round(window_ms / 1000.0 * fs)))
+    return rolling_rms(a_filtered, window) <= acc_rms_thresh
 
 
 # ============================================================
@@ -782,3 +899,235 @@ def export_c_snippet(filter_id: str, fs: float, **params) -> str:
         return _render_biquad_c(sos, fs, "notch", f"Notch IIR, f0 = {f0:.2f} Hz, Q = {q:.1f}")
 
     raise ValueError(f"no hay exportador de C para '{filter_id}'")
+
+
+# ============================================================
+# E2 / E3 / E4 — orientation and thermal C exporters (PLAN-V2.md §8)
+#
+# Same contract as §5.6 above: every constant here is the exact parameter
+# the UI's Orientation/Sensor tabs used to draw the curve on screen. The
+# per-sample operation sequence in each C function is written to match
+# imu.mahony_step / imu.madgwick_step exactly, line for line — test_dsp.py
+# checks a Python transliteration of each against those functions, which
+# is what makes "what you see is what ships" checkable for these two
+# instead of only asserted in a docstring.
+# ============================================================
+
+
+def export_mahony_c(
+    fs: float,
+    kp: float,
+    ki: float,
+    g_mag: float,
+    q0: Tuple[float, float, float, float],
+    tol_mag: float = 1.0,
+    tol_ang_deg: float = 10.0,
+    reject: bool = True,
+) -> str:
+    """E2: Mahony (or, with ki == 0, the explicit complementary filter —
+    same code, one constant at zero, see PLAN-V2.md §5.3) exported as a
+    self-contained C function returning `a_vert` directly, so E1's
+    low-pass snippet can be chained straight onto its output."""
+    label = "Complementario (Mahony con Ki = 0)" if ki <= 0 else "Mahony (PI, con bias de giro)"
+    dt = 1.0 / fs
+    q0w, q0x, q0y, q0z = q0
+    cos_tol = math.cos(math.radians(tol_ang_deg))
+
+    lines = [
+        f"// {label} @ fs = {fs:.1f} Hz — PLAN-V2.md §5.3 / §8 (E2)",
+        "// Generado por clients/desktop. Devuelve a_vert = a . g_hat(t) - |g|; encadenar",
+        "// con el pasa-bajos exportado en E1 (PLAN.md §5.6) sobre ese resultado.",
+        "// Estado: q[4] + bias_i[3] = 7 floats. Costo por muestra: ~55 flops + 2 sqrtf.",
+        f"static const float MAHONY_KP = {kp:.8f}f;",
+        f"static const float MAHONY_KI = {ki:.8f}f;",
+        f"static const float MAHONY_DT = {dt:.8f}f;",
+        f"static const float G_MAG = {g_mag:.6f}f;",
+    ]
+    if reject:
+        lines += [
+            f"static const float ACC_TOL_MAG = {tol_mag:.6f}f;       // rechazo: | |a| - |g| | < esto",
+            f"static const float ACC_TOL_COS_ANG = {cos_tol:.6f}f;   // cos({tol_ang_deg:.1f} deg)",
+        ]
+    lines += [
+        f"static float q[4] = {{ {q0w:.8f}f, {q0x:.8f}f, {q0y:.8f}f, {q0z:.8f}f }};  // desde \"Capturar reposo\"",
+        "static float bias_i[3] = { 0.0f, 0.0f, 0.0f };",
+        "",
+        "// gx/gy/gz en rad/s, ax/ay/az en m/s^2. Devuelve a_vert, m/s^2.",
+        "static inline float mahony_step_vert(float gx, float gy, float gz, float ax, float ay, float az) {",
+        "    float q0_ = q[0], q1_ = q[1], q2_ = q[2], q3_ = q[3];",
+        "    float vx = 2.0f * (q1_*q3_ - q0_*q2_);",
+        "    float vy = 2.0f * (q0_*q1_ + q2_*q3_);",
+        "    float vz = q0_*q0_ - q1_*q1_ - q2_*q2_ + q3_*q3_;",
+        "",
+        "    float n = sqrtf(ax*ax + ay*ay + az*az);",
+        "    int accept = n > 1e-6f;",
+    ]
+    if reject:
+        lines.append("    if (accept) accept = fabsf(n - G_MAG) < ACC_TOL_MAG;")
+    lines += [
+        "    float axn = 0.0f, ayn = 0.0f, azn = 0.0f;",
+        "    if (accept) { axn = ax / n; ayn = ay / n; azn = az / n; }",
+    ]
+    if reject:
+        lines.append("    if (accept) accept = (axn*vx + ayn*vy + azn*vz) > ACC_TOL_COS_ANG;")
+    lines += [
+        "    if (accept) {",
+        "        float ex = ayn*vz - azn*vy, ey = azn*vx - axn*vz, ez = axn*vy - ayn*vx;",
+    ]
+    if ki > 0.0:
+        lines += [
+            "        bias_i[0] += MAHONY_KI * ex * MAHONY_DT;",
+            "        bias_i[1] += MAHONY_KI * ey * MAHONY_DT;",
+            "        bias_i[2] += MAHONY_KI * ez * MAHONY_DT;",
+        ]
+    lines += [
+        "        gx += MAHONY_KP * ex; gy += MAHONY_KP * ey; gz += MAHONY_KP * ez;",
+        "    }",
+        "    gx += bias_i[0]; gy += bias_i[1]; gz += bias_i[2];",
+        "",
+        "    float hx = gx * 0.5f * MAHONY_DT, hy = gy * 0.5f * MAHONY_DT, hz = gz * 0.5f * MAHONY_DT;",
+        "    float q0n = q0_ - q1_*hx - q2_*hy - q3_*hz;",
+        "    float q1n = q1_ + q0_*hx + q2_*hz - q3_*hy;",
+        "    float q2n = q2_ + q0_*hy - q1_*hz + q3_*hx;",
+        "    float q3n = q3_ + q0_*hz + q1_*hy - q2_*hx;",
+        "    float qn = sqrtf(q0n*q0n + q1n*q1n + q2n*q2n + q3n*q3n);",
+        "    q[0] = q0n / qn; q[1] = q1n / qn; q[2] = q2n / qn; q[3] = q3n / qn;",
+        "",
+        "    float gbx = 2.0f * (q[1]*q[3] - q[0]*q[2]);",
+        "    float gby = 2.0f * (q[0]*q[1] + q[2]*q[3]);",
+        "    float gbz = q[0]*q[0] - q[1]*q[1] - q[2]*q[2] + q[3]*q[3];",
+        "    return ax*gbx + ay*gby + az*gbz - G_MAG;",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+def export_madgwick_c(
+    fs: float,
+    beta: float,
+    g_mag: float,
+    q0: Tuple[float, float, float, float],
+    tol_mag: float = 1.0,
+    tol_ang_deg: float = 10.0,
+    reject: bool = True,
+) -> str:
+    """E3: Madgwick's IMU (no-magnetometer) gradient-descent update,
+    exported the same way as E2 — see PLAN-V2.md §5.6/§8. No bias state:
+    the IMU variant's deriving compensation only exists in the MARG
+    (with-magnetometer) form, which this project explicitly doesn't use
+    (§10 — no magnetometer)."""
+    dt = 1.0 / fs
+    q0w, q0x, q0y, q0z = q0
+    cos_tol = math.cos(math.radians(tol_ang_deg))
+
+    lines = [
+        f"// Madgwick IMU, beta = {beta:.4f} @ fs = {fs:.1f} Hz — PLAN-V2.md §5.6 / §8 (E3)",
+        "// Generado por clients/desktop. Devuelve a_vert = a . g_hat(t) - |g|; encadenar",
+        "// con el pasa-bajos exportado en E1 (PLAN.md §5.6) sobre ese resultado.",
+        "// Estado: q[4] = 4 floats. Costo por muestra: ~100 flops + 2 sqrtf.",
+        f"static const float MADGWICK_BETA = {beta:.8f}f;",
+        f"static const float MADGWICK_DT = {dt:.8f}f;",
+        f"static const float G_MAG = {g_mag:.6f}f;",
+    ]
+    if reject:
+        lines += [
+            f"static const float ACC_TOL_MAG = {tol_mag:.6f}f;",
+            f"static const float ACC_TOL_COS_ANG = {cos_tol:.6f}f;   // cos({tol_ang_deg:.1f} deg)",
+        ]
+    lines += [
+        f"static float q[4] = {{ {q0w:.8f}f, {q0x:.8f}f, {q0y:.8f}f, {q0z:.8f}f }};  // desde \"Capturar reposo\"",
+        "",
+        "static inline float madgwick_step_vert(float gx, float gy, float gz, float ax, float ay, float az) {",
+        "    float q0_ = q[0], q1_ = q[1], q2_ = q[2], q3_ = q[3];",
+        "    float n = sqrtf(ax*ax + ay*ay + az*az);",
+        "    int accept = n > 1e-6f;",
+    ]
+    if reject:
+        lines.append("    if (accept) accept = fabsf(n - G_MAG) < ACC_TOL_MAG;")
+    lines += [
+        "    float axn = 0.0f, ayn = 0.0f, azn = 0.0f;",
+        "    if (accept) { axn = ax / n; ayn = ay / n; azn = az / n; }",
+    ]
+    if reject:
+        lines += [
+            "    if (accept) {",
+            "        float vx = 2.0f*(q1_*q3_ - q0_*q2_), vy = 2.0f*(q0_*q1_ + q2_*q3_);",
+            "        float vz = q0_*q0_ - q1_*q1_ - q2_*q2_ + q3_*q3_;",
+            "        accept = (axn*vx + ayn*vy + azn*vz) > ACC_TOL_COS_ANG;",
+            "    }",
+        ]
+    lines += [
+        "",
+        "    float qd0 = -0.5f * (q1_*gx + q2_*gy + q3_*gz);",
+        "    float qd1 =  0.5f * (q0_*gx + q2_*gz - q3_*gy);",
+        "    float qd2 =  0.5f * (q0_*gy - q1_*gz + q3_*gx);",
+        "    float qd3 =  0.5f * (q0_*gz + q1_*gy - q2_*gx);",
+        "",
+        "    if (accept) {",
+        "        float f1 = 2.0f*(q1_*q3_ - q0_*q2_) - axn;",
+        "        float f2 = 2.0f*(q0_*q1_ + q2_*q3_) - ayn;",
+        "        float f3 = 1.0f - 2.0f*(q1_*q1_ + q2_*q2_) - azn;",
+        "        float j11j24 = 2.0f*q2_, j12j23 = 2.0f*q3_, j13j22 = 2.0f*q0_, j14j21 = 2.0f*q1_;",
+        "        float j32 = 2.0f*j14j21, j33 = 2.0f*j11j24;",
+        "        float g0 = j14j21*f2 - j11j24*f1;",
+        "        float g1 = j12j23*f1 + j13j22*f2 - j32*f3;",
+        "        float g2 = -j13j22*f1 + j12j23*f2 - j33*f3;",
+        "        float g3 = j11j24*f1 + j14j21*f2;",
+        "        float gn = sqrtf(g0*g0 + g1*g1 + g2*g2 + g3*g3);",
+        "        if (gn > 1e-9f) {",
+        "            qd0 -= MADGWICK_BETA * g0 / gn; qd1 -= MADGWICK_BETA * g1 / gn;",
+        "            qd2 -= MADGWICK_BETA * g2 / gn; qd3 -= MADGWICK_BETA * g3 / gn;",
+        "        }",
+        "    }",
+        "",
+        "    float q0n = q0_ + qd0*MADGWICK_DT, q1n = q1_ + qd1*MADGWICK_DT;",
+        "    float q2n = q2_ + qd2*MADGWICK_DT, q3n = q3_ + qd3*MADGWICK_DT;",
+        "    float qn2 = sqrtf(q0n*q0n + q1n*q1n + q2n*q2n + q3n*q3n);",
+        "    q[0] = q0n/qn2; q[1] = q1n/qn2; q[2] = q2n/qn2; q[3] = q3n/qn2;",
+        "",
+        "    float gbx = 2.0f * (q[1]*q[3] - q[0]*q[2]);",
+        "    float gby = 2.0f * (q[0]*q[1] + q[2]*q[3]);",
+        "    float gbz = q[0]*q[0] - q[1]*q[1] - q[2]*q[2] + q[3]*q[3];",
+        "    return ax*gbx + ay*gby + az*gbz - G_MAG;",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+def export_thermal_c(fits: Dict[str, object], t_ref: float, min_r2: float = 0.8) -> str:
+    """E4 (PLAN-V2.md §5.7/§8): per-axis bias-vs-temperature correction,
+    `x - slope*(T - T_ref)`. Exported only for axes whose fit's R² clears
+    `min_r2`; if none do, the snippet is a comment explaining why —
+    hypothesis §9.6 expects this to be the common case once C4's per-rest
+    re-bias is running.
+
+    `fits` maps axis name -> an object with `.slope` and `.r2` attributes
+    (imu.ThermalFit satisfies this; kept duck-typed so this module doesn't
+    need to import imu.py)."""
+    good = {name: fit for name, fit in fits.items() if fit is not None and fit.r2 >= min_r2}
+    if not good:
+        return (
+            "// Corrección térmica NO exportada (PLAN-V2.md §8, E4): ningún eje alcanzó\n"
+            f"// R² >= {min_r2:.2f} en el ajuste bias-vs-temperatura.\n"
+            "// Con el re-bias por reposo (C4) alcanza; un modelo térmico en firmware no\n"
+            "// aporta sobre esta captura — ver hipótesis 6 de PLAN-V2.md §9."
+        )
+
+    lines = [
+        f"// Corrección térmica de bias @ T_ref = {t_ref:.3f} °C — PLAN-V2.md §5.7 / §8 (E4)",
+        "// x_corregido = x - pendiente * (T_actual - T_REF). Generado por clients/desktop.",
+        f"static const float T_REF = {t_ref:.4f}f;",
+    ]
+    for name in sorted(fits.keys()):
+        fit = fits[name]
+        if fit is None:
+            continue
+        note = "" if fit.r2 >= min_r2 else f"  // R²={fit.r2:.3f} < {min_r2:.2f} -- no aplicar"
+        lines.append(f"static const float THERMAL_SLOPE_{name.upper()} = {fit.slope:.10f}f;{note}")
+    lines += [
+        "",
+        "static inline float thermal_correct(float x, float slope, float t_now) {",
+        "    return x - slope * (t_now - T_REF);",
+        "}",
+    ]
+    return "\n".join(lines)
