@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -42,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 import dsp
+import imu
 from ble import BleWorker
 from protocol import (
     FLAG_ACCEL_CLIPPED,
@@ -53,6 +56,24 @@ from protocol import (
     magnitude,
     to_hex,
 )
+
+# PLAN-V2.md §3.4 — the orientation estimator bank. O0 (fixed snapshot) is
+# handled entirely by the existing project_vertical path and never touches
+# imu.OrientationTracker.
+ORIENTATION_ESTIMATORS = [
+    ("O0", "O0 — Snapshot fijo (proyección de vbt.ts)"),
+    ("O1", "O1 — Solo giro (integración pura)"),
+    ("O2", "O2 — Solo acelerómetro (tilt por muestra)"),
+    ("O3", "O3 — Complementario (Mahony, Ki=0)"),
+    ("O4", "O4 — Mahony (PI, con bias) — default"),
+    ("O5", "O5 — Madgwick IMU"),
+]
+
+REST_DETECTORS = [
+    ("Z1", "Z1 — RMS |a| (vbt.ts)"),
+    ("Z2", "Z2 — ARE (energía de giro)"),
+    ("Z3", "Z3 — SHOE (acelerómetro + giro)"),
+]
 
 BUFFER_MAXLEN = 6000  # 60s at 100Hz — PLAN.md §6
 VISIBLE_WINDOW_S = 10.0
@@ -246,6 +267,17 @@ class MainWindow(QMainWindow):
         self._current_grid: Optional[dsp.Grid] = None
         self._timing: Optional[dsp.TimingStats] = None
         self._last_stream_ts: Optional[int] = None
+
+        # PLAN-V2.md §4/§6 — orientation fusion state. The tracker is
+        # persistent across ticks (recreated only when its config or the
+        # calibration changes); `_orient_cache` is what makes advancing it
+        # incremental instead of a full O(buffer) pass every 33ms tick —
+        # see _advance_orientation().
+        self.orientation_tracker: Optional[imu.OrientationTracker] = None
+        self._orient_cache: dict = {}  # seq0, quats, accepted, bias, config key
+        self.online_bias = imu.OnlineBias()
+        self._last_applied_rest_end: int = -1  # C4: last rest interval already folded into the tracker's bias
+        self._thermal_fits: Dict[str, imu.ThermalFit] = {}  # per-axis A5/C6 fits, keyed by axis name
 
         self._ble_signals = BleSignals()
         self._ble_signals.state_changed.connect(self._on_ble_state)
@@ -465,6 +497,19 @@ class MainWindow(QMainWindow):
         if health:
             line2 += " · ⚠ " + " · ".join(health)
 
+        # PLAN-V2.md §7 — current temperature and drift from the
+        # calibration temperature (C5b): the guard the same section
+        # requires, so a stale calibration is visible without opening
+        # the Sensor tab.
+        if self._current_grid is not None and dsp.gyro_available(self._current_grid):
+            t_now = self._current_grid.temp_c[-1]
+            if np.isfinite(t_now):
+                line2 += f" · T={t_now:.1f}°C"
+                if self.calib is not None and np.isfinite(self.calib.temp_c):
+                    dT = t_now - self.calib.temp_c
+                    if abs(dT) > 2.0:
+                        line2 += f" ⚠ ΔT={dT:+.1f}°C desde calibración"
+
         if self.status_notice:
             line2 += f"   [{self.status_notice}]"
         if self._integrity_warning:
@@ -630,7 +675,7 @@ class MainWindow(QMainWindow):
         plots_col = QVBoxLayout()
         self.velocity_plots: List[pg.PlotWidget] = []
         self.velocity_curves = []
-        for label in ["Vx (m/s)", "Vy (m/s)", "Vz (m/s)", "V vertical (m/s)"]:
+        for label in ["Vx (m/s)", "Vy (m/s)", "Vz (m/s)"]:
             plot = pg.PlotWidget()
             plot.setLabel("left", label)
             plot.setLabel("bottom", "t (s)")
@@ -641,6 +686,26 @@ class MainWindow(QMainWindow):
             self.velocity_plots.append(plot)
             self.velocity_curves.append(curve)
             plots_col.addWidget(plot)
+
+        # V vertical carries TWO curves (PLAN-V2.md §7): the fixed-snapshot
+        # projection (grey, always the vbt.ts-comparable number) and the
+        # dynamic orientation-based one (color) — the contrast between them
+        # IS the demonstration of §4.3's gravity leak (PLAN-V2.md §12.2).
+        vvert_plot = pg.PlotWidget()
+        vvert_plot.setLabel("left", "V vertical (m/s)")
+        vvert_plot.setLabel("bottom", "t (s)")
+        vvert_plot.showGrid(x=True, y=True, alpha=0.2)
+        vvert_plot.setXLink(self.velocity_plots[0])
+        self.v_vert_fixed_curve = vvert_plot.plot([], [], pen=pg.mkPen((150, 150, 150), width=2), name="fija (O0)")
+        self.v_vert_dynamic_curve = vvert_plot.plot([], [], pen=pg.mkPen((0, 220, 120), width=2), name="dinámica")
+        vvert_plot.addLegend()
+        self.velocity_plots.append(vvert_plot)
+        self.velocity_curves.append(self.v_vert_fixed_curve)  # kept for _visible_slice-style code that expects 4 entries
+        plots_col.addWidget(vvert_plot)
+
+        self.v_leak_label = QLabel("")
+        self.v_leak_label.setWordWrap(True)
+        plots_col.addWidget(self.v_leak_label)
         outer.addLayout(plots_col, stretch=4)
 
         side = QVBoxLayout()
@@ -655,18 +720,48 @@ class MainWindow(QMainWindow):
         self.gravity_check.setChecked(True)
         side.addWidget(self.gravity_check)
 
+        side.addWidget(QLabel("Fuente de V vertical:"))
+        self.vvert_source_combo = QComboBox()
+        self.vvert_source_combo.addItem("Proyección fija (O0, vbt.ts)", "fixed")
+        self.vvert_source_combo.addItem("Orientación dinámica (pestaña Orientation)", "dynamic")
+        side.addWidget(self.vvert_source_combo)
+
         side.addWidget(QLabel("Corrección de drift:"))
         self.drift_combo = QComboBox()
         self.drift_combo.addItem("Detrend (lineal)", "detrend")
+        self.drift_combo.addItem("Detrend por segmentos (I4)", "segments")
         self.drift_combo.addItem("High-pass 0.3 Hz", "highpass")
         self.drift_combo.addItem("Ninguno", "none")
         side.addWidget(self.drift_combo)
+
+        side.addWidget(QLabel("Detector de reposo (ZUPT / I4 / C4 / O6):"))
+        self.rest_detector_combo = QComboBox()
+        for det_id, label in REST_DETECTORS:
+            self.rest_detector_combo.addItem(label, det_id)
+        side.addWidget(self.rest_detector_combo)
 
         self.zupt_check = QCheckBox("ZUPT (zero-velocity update)")
         side.addWidget(self.zupt_check)
 
         self.raw_integration_check = QCheckBox("Integración cruda (sin correcciones)")
         side.addWidget(self.raw_integration_check)
+
+        side.addWidget(QLabel("Brazo de palanca (G5, PLAN-V2.md §5.9):"))
+        self.lever_arm_check = QCheckBox("Compensar brazo de palanca")
+        side.addWidget(self.lever_arm_check)
+        lever_form = QFormLayout()
+        self.lever_r_spins = {}
+        for axis in ("rx", "ry", "rz"):
+            box = QDoubleSpinBox()
+            box.setRange(-200.0, 200.0)
+            box.setSingleStep(1.0)
+            box.setSuffix(" mm")
+            self.lever_r_spins[axis] = box
+            lever_form.addRow(f"{axis} (sensor→eje)", box)
+        side.addLayout(lever_form)
+        self.lever_rms_label = QLabel("")
+        self.lever_rms_label.setWordWrap(True)
+        side.addWidget(self.lever_rms_label)
 
         side.addStretch()
         outer.addLayout(side, stretch=1)
@@ -677,24 +772,190 @@ class MainWindow(QMainWindow):
         if grid is None:
             return
         n = max(1, int(round(1.0 * grid.fs)))  # trailing 1s, matching vbt.ts's CALIB_MS
-        calib = dsp.calibrate(grid.ax[-n:], grid.ay[-n:], grid.az[-n:])
+        calib = dsp.calibrate(
+            grid.ax[-n:], grid.ay[-n:], grid.az[-n:], grid.gx[-n:], grid.gy[-n:], grid.gz[-n:], grid.temp_c[-n:]
+        )
         if calib is None:
-            self.calib_label.setText("Calibración rechazada: no estaba quieto, o |g| fuera de rango.")
+            self.calib_label.setText(
+                "Calibración rechazada: no estaba quieto (accel o giro), o |g| fuera de rango."
+            )
             return
         self.calib = calib
-        self.calib_label.setText(
-            f"Calibrado: bias=({calib.bias[0]:.3f}, {calib.bias[1]:.3f}, {calib.bias[2]:.3f}) m/s²  |g|={calib.g_mag:.3f}"
-        )
+        # Re-seed the orientation tracker from the same rest vector that
+        # calibrates project_vertical (PLAN-V2.md §5.2 C3) so O0 and the
+        # dynamic estimators agree exactly while the barbell hasn't tilted.
+        self.orientation_tracker = None
+        self._orient_cache = {}
+        self.online_bias = imu.OnlineBias()
+        self._last_applied_rest_end = -1
 
-    def _apply_drift_correction(self, t: np.ndarray, v: np.ndarray, a_used: np.ndarray, fs: float) -> np.ndarray:
+        label = f"Calibrado: bias=({calib.bias[0]:.3f}, {calib.bias[1]:.3f}, {calib.bias[2]:.3f}) m/s²  |g|={calib.g_mag:.3f}"
+        if np.all(np.isfinite(calib.gyro_bias)):
+            label += (
+                f"\nGiro bias=({math.degrees(calib.gyro_bias[0]):.2f}, {math.degrees(calib.gyro_bias[1]):.2f}, "
+                f"{math.degrees(calib.gyro_bias[2]):.2f}) °/s  σa={calib.sigma_a:.3f} m/s²  σg={math.degrees(calib.sigma_g):.3f} °/s"
+            )
+            if np.isfinite(calib.temp_c):
+                label += f"  T_cal={calib.temp_c:.1f}°C"
+        self.calib_label.setText(label)
+
+    def _apply_drift_correction(
+        self, t: np.ndarray, v: np.ndarray, a_used: np.ndarray, fs: float, rest_intervals: Optional[List[Tuple[int, int]]] = None
+    ) -> np.ndarray:
         mode = self.drift_combo.currentData()
         if mode == "detrend":
             v, _bias = dsp.detrend_linear(t, v)
+        elif mode == "segments" and rest_intervals is not None:
+            # I4 (PLAN-V2.md §5.5): needs the rest intervals up front, so
+            # this branch is skipped (falls through to no correction) if
+            # the caller couldn't compute them (no gyro, no calibration).
+            v = dsp.detrend_segments(t, v, rest_intervals)
         elif mode == "highpass":
             v = dsp.apply_butter_hp(v, fs, fc=0.3, order=1)
         if self.zupt_check.isChecked():
-            v = dsp.apply_zupt(v, a_used, fs)
+            if rest_intervals is not None:
+                mask = np.zeros(len(v), dtype=bool)
+                for s, e in rest_intervals:
+                    mask[s : e + 1] = True
+                v = dsp.apply_zupt_mask(v, mask)
+            else:
+                v = dsp.apply_zupt(v, a_used, fs)
         return v
+
+    # -- orientation fusion: shared by Velocity, Orientation and Filters --
+
+    def _orientation_config_key(self) -> tuple:
+        return (
+            self.orientation_estimator_combo.currentData(),
+            round(self.orientation_kp_spin.value(), 4),
+            round(self.orientation_ki_spin.value(), 4),
+            round(self.orientation_beta_spin.value(), 4),
+            self.orientation_reject_check.isChecked(),
+            round(self.orientation_tol_mag_spin.value(), 3),
+            round(self.orientation_tol_ang_spin.value(), 2),
+            id(self.calib),
+        )
+
+    def _compute_rest_mask(self, grid: dsp.Grid, a_for_rms: np.ndarray) -> np.ndarray:
+        """The rest mask feeding ZUPT/I4/C4/O6, per PLAN-V2.md §5.5's
+        selector. Z1 is Z1's own dsp helper; Z2/Z3 need per-sensor noise
+        (sigma_a/sigma_g), preferring the values measured at "Capturar
+        reposo" over a same-capture fallback so a short/noisy visible
+        window doesn't distort the very calibration it's meant to use."""
+        detector = self.rest_detector_combo.currentData()
+        if detector == "Z1" or not dsp.gyro_available(grid):
+            return dsp.rolling_rms_rest_mask(a_for_rms, grid.fs)
+
+        sigma_a = self.calib.sigma_a if self.calib is not None and np.isfinite(self.calib.sigma_a) else float(np.nanstd(a_for_rms))
+        sigma_g = (
+            self.calib.sigma_g
+            if self.calib is not None and np.isfinite(self.calib.sigma_g)
+            else float(np.nanstd(grid.gx))
+        )
+        sigma_a = sigma_a if sigma_a > 1e-6 else 0.02
+        sigma_g = sigma_g if sigma_g > 1e-6 else 0.01
+        gyr = np.stack([grid.gx, grid.gy, grid.gz], axis=1)
+        if detector == "Z2":
+            stat = imu.are(gyr, grid.fs, sigma_g)
+        else:  # Z3
+            acc = np.stack([grid.ax, grid.ay, grid.az], axis=1)
+            g_mag = self.calib.g_mag if self.calib is not None else 9.81
+            stat = imu.shoe(acc, gyr, grid.fs, sigma_a, sigma_g, g_mag)
+        return imu.rest_mask_from_statistic(stat)
+
+    def _rest_intervals(self, grid: dsp.Grid, a_for_rms: np.ndarray) -> List[Tuple[int, int]]:
+        mask = self._compute_rest_mask(grid, a_for_rms)
+        return imu.find_rest_intervals(mask, grid.fs)
+
+    def _advance_orientation(self, grid: dsp.Grid) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Advances (or recreates) the persistent OrientationTracker and
+        returns (quats, accepted, bias) aligned 1:1 with `grid`. Caches by
+        `grid.seq0` rather than array position, since LiveBuffer's
+        deque(maxlen=...) evicts from the front and to_grid rebuilds from
+        scratch every tick (PLAN-V2.md §6) -- see Grid.seq0's docstring."""
+        if not dsp.gyro_available(grid) or self.calib is None:
+            return None
+
+        n = len(grid.t)
+        dt = 1.0 / grid.fs
+        key = self._orientation_config_key()
+
+        if self.orientation_tracker is None or self._orient_cache.get("key") != key:
+            estimator, kp, ki, beta, reject, tol_mag, tol_ang, _calib_id = key
+            q0 = imu.tilt_quat(*self.calib.bias)
+            self.orientation_tracker = imu.OrientationTracker(
+                estimator=estimator, q0=q0, kp=kp, ki=ki, beta=beta, g_ref=self.calib.g_mag,
+                reject=reject, tol_mag=tol_mag, tol_ang_deg=tol_ang,
+            )
+            self._orient_cache = {
+                "key": key, "seq0": None,
+                "quats": np.empty((0, 4)), "accepted": np.empty((0,), dtype=bool), "bias": np.empty((0, 3)),
+            }
+            self._last_applied_rest_end = -1
+            self.online_bias = imu.OnlineBias()
+
+        cache = self._orient_cache
+        prev_seq0 = cache["seq0"]
+        prev_quats, prev_accepted, prev_bias = cache["quats"], cache["accepted"], cache["bias"]
+
+        prefix_len = 0
+        if prev_seq0 is not None:
+            offset = grid.seq0 - prev_seq0
+            if 0 <= offset <= len(prev_quats):
+                prefix_len = len(prev_quats) - offset
+            else:
+                # A segment cut/reboot/non-monotonic jump broke the overlap
+                # assumption -- restart at the calibration's orientation
+                # rather than propagate state across a discontinuity.
+                self.orientation_tracker.reset()
+
+        quats_prefix = prev_quats[len(prev_quats) - prefix_len :] if prefix_len else np.empty((0, 4))
+        accepted_prefix = prev_accepted[len(prev_accepted) - prefix_len :] if prefix_len else np.empty((0,), dtype=bool)
+        bias_prefix = prev_bias[len(prev_bias) - prefix_len :] if prefix_len else np.empty((0, 3))
+
+        start = len(quats_prefix)
+        if start < n:
+            new_q, new_acc, new_bias = self.orientation_tracker.process_new(
+                grid.gx[start:], grid.gy[start:], grid.gz[start:], grid.ax[start:], grid.ay[start:], grid.az[start:], dt
+            )
+        else:
+            new_q, new_acc, new_bias = np.empty((0, 4)), np.empty((0,), dtype=bool), np.empty((0, 3))
+
+        quats = np.concatenate([quats_prefix, new_q], axis=0)
+        accepted = np.concatenate([accepted_prefix, new_acc], axis=0)
+        bias = np.concatenate([bias_prefix, new_bias], axis=0)
+
+        # C4: fold a freshly completed rest interval's gyro bias/tilt into
+        # the tracker so it applies starting next tick (tick-granularity
+        # approximation of "right when the rest ends" -- fine since rests
+        # last seconds and ticks are 33ms).
+        if self.online_bias_check.isChecked() and len(quats) == n and self.orientation_estimator_combo.currentData() in ("O3", "O4"):
+            a_vert_fixed = dsp.project_vertical(grid.ax, grid.ay, grid.az, self.calib)
+            rest_intervals = self._rest_intervals(grid, a_vert_fixed)
+            new_intervals = [iv for iv in rest_intervals if iv[1] > self._last_applied_rest_end]
+            if new_intervals:
+                gyr = np.stack([grid.gx, grid.gy, grid.gz], axis=1)
+                acc = np.stack([grid.ax, grid.ay, grid.az], axis=1)
+                for end_idx, bias_est, _q_anchor in self.online_bias.update(gyr, acc, new_intervals):
+                    self.orientation_tracker.set_gyro_bias(*bias_est)
+                    self._last_applied_rest_end = end_idx
+
+        cache.update(seq0=grid.seq0, quats=quats, accepted=accepted, bias=bias)
+        if len(quats) != n:
+            return None
+        return quats, accepted, bias
+
+    def _lever_arm_compensated(self, grid: dsp.Grid) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """G5: applies the checkbox's r-vector compensation if enabled and
+        gyro is available; otherwise returns the raw axes unchanged."""
+        if not self.lever_arm_check.isChecked() or not dsp.gyro_available(grid):
+            return grid.ax, grid.ay, grid.az
+        r = tuple(self.lever_r_spins[k].value() / 1000.0 for k in ("rx", "ry", "rz"))  # mm -> m
+        gyr = np.stack([grid.gx, grid.gy, grid.gz], axis=1)
+        alpha = imu.angular_acceleration(gyr, grid.fs)
+        acc = np.stack([grid.ax, grid.ay, grid.az], axis=1)
+        compensated = imu.lever_arm_correction(acc, gyr, alpha, r)
+        return compensated[:, 0], compensated[:, 1], compensated[:, 2]
 
     def _refresh_velocity(self) -> None:
         grid = self._current_grid
@@ -706,35 +967,77 @@ class MainWindow(QMainWindow):
         raw_mode = self.raw_integration_check.isChecked()
         sl = self._visible_slice(fs, len(grid.t))
 
+        ax, ay, az = self._lever_arm_compensated(grid)
+        if dsp.gyro_available(grid):
+            gyr = np.stack([grid.gx, grid.gy, grid.gz], axis=1)
+            r = tuple(self.lever_r_spins[k].value() / 1000.0 for k in ("rx", "ry", "rz"))
+            lever_rms = imu.lever_arm_rms(gyr, r)
+            note = "" if lever_rms > 0.05 else "  (por debajo de 0.05 m/s² — probablemente no vale la pena)"
+            self.lever_rms_label.setText(f"RMS de ω×(ω×r): {lever_rms:.3f} m/s²{note}")
+        else:
+            self.lever_rms_label.setText("")
+
+        raw_axes = {"ax": ax, "ay": ay, "az": az}
+        rest_intervals = None
+        if self.calib is not None:
+            a_vert_for_rest = dsp.project_vertical(ax, ay, az, self.calib)
+            rest_intervals = self._rest_intervals(grid, a_vert_for_rest)
+
         for curve, axis_key, bias_idx in zip(self.velocity_curves[:3], ("ax", "ay", "az"), (0, 1, 2)):
-            a_filt = dsp.apply_filter(filter_id, getattr(grid, axis_key), fs, **params)
+            a_filt = dsp.apply_filter(filter_id, raw_axes[axis_key], fs, **params)
             if not raw_mode and self.gravity_check.isChecked() and self.calib is not None:
                 a_used = a_filt - self.calib.bias[bias_idx]
             else:
                 a_used = a_filt
             v = dsp.integrate_velocity(a_used, grid.t)
             if not raw_mode:
-                v = self._apply_drift_correction(grid.t, v, a_used, fs)
+                v = self._apply_drift_correction(grid.t, v, a_used, fs, rest_intervals)
             curve.setData(grid.t[sl], v[sl])
 
-        if self.calib is not None:
-            # a . g_hat - |g| is linear, so filtering this scalar projection
-            # is identical to projecting the filtered vector, at a third of
-            # the arithmetic (vbt.ts:716's own reasoning, reused as-is).
-            a_vert = dsp.project_vertical(grid.ax, grid.ay, grid.az, self.calib)
-            a_vert_filt = dsp.apply_filter(filter_id, a_vert, fs, **params)
-            v_vert = dsp.integrate_velocity(a_vert_filt, grid.t)
-            if not raw_mode:
-                v_vert = self._apply_drift_correction(grid.t, v_vert, a_vert_filt, fs)
-            self.velocity_curves[3].setData(grid.t[sl], v_vert[sl])
+        if self.calib is None:
+            self.v_vert_fixed_curve.setData([], [])
+            self.v_vert_dynamic_curve.setData([], [])
+            self.v_leak_label.setText("")
+            return
+
+        # Fixed (O0): a . g_hat0 - |g| is linear, so filtering this scalar
+        # projection equals projecting the filtered vector, at a third of
+        # the arithmetic (vbt.ts:716's own reasoning, reused as-is).
+        a_vert_fixed = dsp.project_vertical(ax, ay, az, self.calib)
+        a_vert_fixed_filt = dsp.apply_filter(filter_id, a_vert_fixed, fs, **params)
+        v_vert_fixed = dsp.integrate_velocity(a_vert_fixed_filt, grid.t)
+        if not raw_mode:
+            v_vert_fixed = self._apply_drift_correction(grid.t, v_vert_fixed, a_vert_fixed_filt, fs, rest_intervals)
+        self.v_vert_fixed_curve.setData(grid.t[sl], v_vert_fixed[sl])
+
+        orient = self._advance_orientation(grid)
+        source = self.vvert_source_combo.currentData()
+        if orient is None or source != "dynamic":
+            self.v_vert_dynamic_curve.setData([], [])
+            self.v_leak_label.setText("Fuente dinámica no disponible: sin giroscopio o sin calibración." if orient is None else "")
+            return
+
+        quats, _accepted, _bias = orient
+        gb = imu.gravity_body_array(quats)
+        a_vert_dyn = imu.vertical_world(ax, ay, az, gb, self.calib.g_mag)
+        a_vert_dyn_filt = dsp.apply_filter(filter_id, a_vert_dyn, fs, **params)
+        v_vert_dyn = dsp.integrate_velocity(a_vert_dyn_filt, grid.t)
+        if not raw_mode:
+            v_vert_dyn = self._apply_drift_correction(grid.t, v_vert_dyn, a_vert_dyn_filt, fs, rest_intervals)
+        self.v_vert_dynamic_curve.setData(grid.t[sl], v_vert_dyn[sl])
+
+        # G3 — the gravity leak, over the visible window (PLAN-V2.md §5.4).
+        v_leak = v_vert_fixed[sl] - v_vert_dyn[sl] if not raw_mode else None
+        if v_leak is not None and len(v_leak):
+            self.v_leak_label.setText(f"Fuga de gravedad (v_leak) al final de la ventana: {v_leak[-1]:+.3f} m/s")
         else:
-            self.velocity_curves[3].setData([], [])
+            self.v_leak_label.setText("")
 
     # -- tab 4: Stats -----------------------------------------------------
 
     STAT_FIELDS = ("max", "min", "mean", "median", "std", "rms", "peak_to_peak")
     STAT_LABELS = ("Max", "Min", "Media", "Mediana", "Std", "RMS", "P2P")
-    STAT_ROWS = ("X", "Y", "Z", "|a|", "gX", "gY", "gZ", "|ω|")
+    STAT_ROWS = ("X", "Y", "Z", "|a|", "gX", "gY", "gZ", "|ω|", "a_vert (mundo)", "θ inclinación (°)", "|a_h| (mundo)")
 
     def _build_stats_tab(self) -> QWidget:
         w = QWidget()
@@ -747,6 +1050,8 @@ class MainWindow(QMainWindow):
         self.stats_scope_combo.addItem("Grabación completa", "full")
         top.addWidget(self.stats_scope_combo)
         top.addStretch()
+        self.stats_clip_label = QLabel("")
+        top.addWidget(self.stats_clip_label)
         layout.addLayout(top)
 
         columns = []
@@ -776,9 +1081,33 @@ class MainWindow(QMainWindow):
             filt = [dsp.apply_filter(filter_id, getattr(grid, k), fs, **params)[sl] for k in keys]
             return list(zip(raw, filt)) + [(magnitude(*raw), magnitude(*filt))]
 
+        clipped_in_scope = int(np.count_nonzero(grid.flags[sl] & (FLAG_ACCEL_CLIPPED | FLAG_GYRO_CLIPPED)))
+        self.stats_clip_label.setText(f"{clipped_in_scope} muestras clippeadas en el ámbito" if clipped_in_scope else "")
+
         rows = triple(("ax", "ay", "az"))
         if dsp.gyro_available(grid):
             rows += triple(("gx", "gy", "gz"))
+
+            # PLAN-V2.md §7 — a_vert(mundo)/θ/|a_h| rows, only once
+            # orientation is actually available (calibrated + gyro).
+            if self.calib is not None:
+                orient = self._advance_orientation(grid)
+                if orient is not None:
+                    quats, _accepted, _bias = orient
+                    q0 = imu.tilt_quat(*self.calib.bias)
+                    gb = imu.gravity_body_array(quats)
+                    a_vert_dyn = imu.vertical_world(grid.ax, grid.ay, grid.az, gb, self.calib.g_mag)
+                    theta = np.array([imu.tilt_angle(tuple(q), q0) for q in quats])
+                    a_h = imu.horizontal_world_mag(grid.ax, grid.ay, grid.az, quats, self.calib.g_mag)
+
+                    a_vert_filt = dsp.apply_filter(filter_id, a_vert_dyn, fs, **params)
+                    theta_filt = dsp.apply_filter(filter_id, theta, fs, **params)
+                    a_h_filt = dsp.apply_filter(filter_id, a_h, fs, **params)
+                    rows += [
+                        (a_vert_dyn[sl], a_vert_filt[sl]),
+                        (theta[sl], theta_filt[sl]),
+                        (a_h[sl], a_h_filt[sl]),
+                    ]
 
         for row_idx in range(len(self.STAT_ROWS)):
             if row_idx >= len(rows):
@@ -797,14 +1126,67 @@ class MainWindow(QMainWindow):
                 self.stats_table.setItem(row_idx, col, QTableWidgetItem(f"{getattr(filt_stats, field):.4f}"))
                 col += 1
 
-    # -- tab 5: Filters -----------------------------------------------------
+    # -- tab 5: Filters (signal filter + orientation + sensor/thermal) --------
 
     def _build_filters_tab(self) -> QWidget:
         w = QWidget()
         outer = QHBoxLayout(w)
 
-        side = QVBoxLayout()
-        side.addWidget(QLabel("Filtro activo (aplica a Accel, Velocity y Stats):"))
+        # Everything that used to be spread across Filters/Orientation/Sensor
+        # tabs lives here now, as stacked sections in one scrollable side
+        # panel — so you can combine a signal filter with an orientation
+        # estimator and a thermal correction without switching tabs.
+        side_content = QWidget()
+        side = QVBoxLayout(side_content)
+        side.addWidget(self._build_signal_filter_group())
+        side.addWidget(self._build_orientation_group())
+        side.addWidget(self._build_sensor_group())
+        side.addStretch()
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setWidget(side_content)
+        side_scroll.setMinimumWidth(340)
+        outer.addWidget(side_scroll, stretch=1)
+
+        plots_content = QWidget()
+        plots_col = QVBoxLayout(plots_content)
+        self.psd_plot = pg.PlotWidget()
+        self.psd_plot.setLogMode(x=True, y=True)
+        self.psd_plot.setLabel("left", "PSD (m²s⁻⁴/Hz)")
+        self.psd_plot.setLabel("bottom", "Frecuencia (Hz)")
+        self.psd_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.psd_raw_curve = self.psd_plot.plot([], [], pen=pg.mkPen((130, 130, 130), width=1), name="crudo")
+        self.psd_filt_curve = self.psd_plot.plot([], [], pen=pg.mkPen((0, 200, 255), width=2), name="filtrado")
+        self.psd_plot.addLegend()
+        plots_col.addWidget(self.psd_plot)
+
+        self.winter_plot = pg.PlotWidget()
+        self.winter_plot.setLabel("left", "Residuo RMS (m/s²)")
+        self.winter_plot.setLabel("bottom", "fc candidato (Hz)")
+        self.winter_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.winter_curve = self.winter_plot.plot([], [], pen=pg.mkPen((255, 180, 0), width=2))
+        self.winter_intercept_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen((255, 80, 80), style=Qt.PenStyle.DashLine))
+        self.winter_chosen_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen((80, 255, 120), style=Qt.PenStyle.DashLine))
+        self.winter_plot.addItem(self.winter_intercept_line)
+        self.winter_plot.addItem(self.winter_chosen_line)
+        plots_col.addWidget(self.winter_plot)
+
+        self._build_orientation_plots(plots_col)
+        self._build_sensor_plots(plots_col)
+
+        plots_scroll = QScrollArea()
+        plots_scroll.setWidgetResizable(True)
+        plots_scroll.setWidget(plots_content)
+        outer.addWidget(plots_scroll, stretch=3)
+
+        self._on_filter_changed()  # populate the param form for the initial selection
+        return w
+
+    def _build_signal_filter_group(self) -> QGroupBox:
+        box = QGroupBox("Filtro de señal (Accel / Velocity / Stats)")
+        side = QVBoxLayout(box)
+        side.addWidget(QLabel("Filtro activo:"))
         self.filter_combo = QComboBox()
         for fid, spec in dsp.FILTER_BANK.items():
             self.filter_combo.addItem(spec.label, fid)
@@ -827,45 +1209,18 @@ class MainWindow(QMainWindow):
         self.filter_axis_combo.addItem("Giro X", "gx")
         self.filter_axis_combo.addItem("Giro Y", "gy")
         self.filter_axis_combo.addItem("Giro Z", "gz")
+        self.filter_axis_combo.addItem("a_vert (mundo, orientación dinámica)", "a_vert_world")
         self.filter_axis_combo.setCurrentIndex(2)  # Z default -- most mounts land close to vertical; switch if not
         side.addWidget(self.filter_axis_combo)
 
-        self.export_btn = QPushButton("Export firmware snippet")
+        self.export_btn = QPushButton("Export firmware snippet (filtro)")
         self.export_btn.clicked.connect(self._on_export_clicked)
         side.addWidget(self.export_btn)
 
         self.winter_label = QLabel("")
         self.winter_label.setWordWrap(True)
         side.addWidget(self.winter_label)
-
-        side.addStretch()
-        outer.addLayout(side, stretch=1)
-
-        plots_col = QVBoxLayout()
-        self.psd_plot = pg.PlotWidget()
-        self.psd_plot.setLogMode(x=True, y=True)
-        self.psd_plot.setLabel("left", "PSD (m²s⁻⁴/Hz)")
-        self.psd_plot.setLabel("bottom", "Frecuencia (Hz)")
-        self.psd_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.psd_raw_curve = self.psd_plot.plot([], [], pen=pg.mkPen((130, 130, 130), width=1), name="crudo")
-        self.psd_filt_curve = self.psd_plot.plot([], [], pen=pg.mkPen((0, 200, 255), width=2), name="filtrado")
-        self.psd_plot.addLegend()
-        plots_col.addWidget(self.psd_plot)
-
-        self.winter_plot = pg.PlotWidget()
-        self.winter_plot.setLabel("left", "Residuo RMS (m/s²)")
-        self.winter_plot.setLabel("bottom", "fc candidato (Hz)")
-        self.winter_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.winter_curve = self.winter_plot.plot([], [], pen=pg.mkPen((255, 180, 0), width=2))
-        self.winter_intercept_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen((255, 80, 80), style=Qt.PenStyle.DashLine))
-        self.winter_chosen_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen((80, 255, 120), style=Qt.PenStyle.DashLine))
-        self.winter_plot.addItem(self.winter_intercept_line)
-        self.winter_plot.addItem(self.winter_chosen_line)
-        plots_col.addWidget(self.winter_plot)
-        outer.addLayout(plots_col, stretch=3)
-
-        self._on_filter_changed()  # populate the param form for the initial selection
-        return w
+        return box
 
     def _on_filter_changed(self) -> None:
         filter_id = self._current_filter_id()
@@ -936,18 +1291,33 @@ class MainWindow(QMainWindow):
         params = self._current_filter_params()
         fs = grid.fs
         axis_key = self.filter_axis_combo.currentData()
-        raw = getattr(grid, axis_key)
+        if axis_key == "a_vert_world":
+            orient = self._advance_orientation(grid) if self.calib is not None else None
+            if orient is None:
+                raw = np.full(len(grid.t), np.nan)
+            else:
+                quats, _accepted, _bias = orient
+                gb = imu.gravity_body_array(quats)
+                raw = imu.vertical_world(grid.ax, grid.ay, grid.az, gb, self.calib.g_mag)
+        else:
+            raw = getattr(grid, axis_key)
 
         self.filter_design_label.setText(self._design_readout(filter_id, fs, params))
 
         # Welch and the Winter sweep both return silent garbage on NaN
-        # input, so refuse the gyro axes on a v1 capture instead of drawing
-        # an empty plot that looks like a result.
+        # input, so refuse an axis with nothing real on it (gyro on a v1
+        # capture, or a_vert(mundo) without a calibration yet) instead of
+        # drawing an empty plot that looks like a result.
         if not np.any(np.isfinite(raw)):
             self.psd_raw_curve.setData([], [])
             self.psd_filt_curve.setData([], [])
             self.winter_curve.setData([], [])
-            self.winter_label.setText("Esta captura no trae giroscopio (paquete v1): elegí un eje de aceleración.")
+            if axis_key == "a_vert_world":
+                self.winter_label.setText("a_vert(mundo) necesita giroscopio y \"Capturar reposo\" en la pestaña Velocity.")
+            else:
+                self.winter_label.setText("Esta captura no trae giroscopio (paquete v1): elegí un eje de aceleración.")
+            self._refresh_orientation()
+            self._refresh_sensor()
             return
 
         filt = dsp.apply_filter(filter_id, raw, fs, **params)
@@ -966,6 +1336,12 @@ class MainWindow(QMainWindow):
             f"Corte sugerido (Winter): {winter.chosen_fc:.1f} Hz  ·  piso de ruido estimado: {winter.intercept:.4f} m/s²"
         )
 
+        # Orientation and Sensor used to be separate tabs; they're now
+        # sections of this same tab (no more tab-switching to combine
+        # filters with orientation/thermal), so one refresh drives all of it.
+        self._refresh_orientation()
+        self._refresh_sensor()
+
     def _on_export_clicked(self) -> None:
         grid = self._current_grid
         if grid is None:
@@ -978,10 +1354,60 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Export", str(exc))
             return
+        self._show_code_dialog(code, f"{filter_id}_filter.h")
 
+    def _on_export_mahony_clicked(self) -> None:
+        grid, calib = self._current_grid, self.calib
+        if grid is None or calib is None:
+            QMessageBox.warning(self, "Export", "Hace falta una captura y \"Capturar reposo\" primero.")
+            return
+        q0 = imu.tilt_quat(*calib.bias)
+        code = dsp.export_mahony_c(
+            grid.fs,
+            kp=self.orientation_kp_spin.value(),
+            ki=self.orientation_ki_spin.value(),
+            g_mag=calib.g_mag,
+            q0=q0,
+            tol_mag=self.orientation_tol_mag_spin.value(),
+            tol_ang_deg=self.orientation_tol_ang_spin.value(),
+            reject=self.orientation_reject_check.isChecked(),
+        )
+        self._show_code_dialog(code, "mahony_orientation.h")
+
+    def _on_export_madgwick_clicked(self) -> None:
+        grid, calib = self._current_grid, self.calib
+        if grid is None or calib is None:
+            QMessageBox.warning(self, "Export", "Hace falta una captura y \"Capturar reposo\" primero.")
+            return
+        q0 = imu.tilt_quat(*calib.bias)
+        code = dsp.export_madgwick_c(
+            grid.fs,
+            beta=self.orientation_beta_spin.value(),
+            g_mag=calib.g_mag,
+            q0=q0,
+            tol_mag=self.orientation_tol_mag_spin.value(),
+            tol_ang_deg=self.orientation_tol_ang_spin.value(),
+            reject=self.orientation_reject_check.isChecked(),
+        )
+        self._show_code_dialog(code, "madgwick_orientation.h")
+
+    def _on_export_thermal_clicked(self) -> None:
+        if self.calib is None or not np.isfinite(self.calib.temp_c):
+            QMessageBox.warning(self, "Export", "Hace falta \"Capturar reposo\" con temperatura disponible (paquete v2).")
+            return
+        fits = getattr(self, "_thermal_fits", None)
+        if not fits:
+            QMessageBox.warning(
+                self, "Export", "Todavía no se ajustó el modelo térmico -- abrí la pestaña Sensor y apretá \"Ajustar térmica\"."
+            )
+            return
+        code = dsp.export_thermal_c(fits, t_ref=self.calib.temp_c)
+        self._show_code_dialog(code, "thermal_correction.h")
+
+    def _show_code_dialog(self, code: str, default_filename: str) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Firmware snippet")
-        dialog.resize(720, 520)
+        dialog.resize(760, 560)
         layout = QVBoxLayout(dialog)
 
         text = QPlainTextEdit()
@@ -996,7 +1422,7 @@ class MainWindow(QMainWindow):
         save_btn = QPushButton("Guardar como…")
 
         def save() -> None:
-            default = str(Path(__file__).parent / f"{filter_id}_filter.h")
+            default = str(Path(__file__).parent / default_filename)
             path_str, _ = QFileDialog.getSaveFileName(dialog, "Guardar snippet", default, "C header (*.h);;Todos (*)")
             if path_str:
                 Path(path_str).write_text(code)
@@ -1011,6 +1437,327 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
 
         dialog.exec()
+
+    # -- Orientation group (merged into the Filters tab) ----------------------
+
+    def _build_orientation_group(self) -> QGroupBox:
+        box = QGroupBox("Orientación (necesita giroscopio + \"Capturar reposo\")")
+        side = QVBoxLayout(box)
+        side.addWidget(QLabel("Estimador de orientación:"))
+        self.orientation_estimator_combo = QComboBox()
+        for est_id, label in ORIENTATION_ESTIMATORS[1:]:  # O0 lives entirely in Velocity's "fixed" source
+            self.orientation_estimator_combo.addItem(label, est_id)
+        self.orientation_estimator_combo.setCurrentIndex(3)  # O4 (Mahony PI) — PLAN-V2.md §1 default
+        side.addWidget(self.orientation_estimator_combo)
+
+        form = QFormLayout()
+        self.orientation_kp_spin = QDoubleSpinBox()
+        self.orientation_kp_spin.setRange(0.0, 10.0)
+        self.orientation_kp_spin.setSingleStep(0.1)
+        self.orientation_kp_spin.setValue(imu.MAHONY_KP_DEFAULT)
+        form.addRow("Kp (Mahony, τ≈1/Kp s)", self.orientation_kp_spin)
+
+        self.orientation_ki_spin = QDoubleSpinBox()
+        self.orientation_ki_spin.setRange(0.0, 2.0)
+        self.orientation_ki_spin.setSingleStep(0.01)
+        self.orientation_ki_spin.setDecimals(3)
+        self.orientation_ki_spin.setValue(imu.MAHONY_KI_DEFAULT)
+        form.addRow("Ki (Mahony; 0 = complementario O3)", self.orientation_ki_spin)
+
+        self.orientation_beta_spin = QDoubleSpinBox()
+        self.orientation_beta_spin.setRange(0.0, 1.0)
+        self.orientation_beta_spin.setSingleStep(0.01)
+        self.orientation_beta_spin.setDecimals(3)
+        self.orientation_beta_spin.setValue(imu.MADGWICK_BETA_DEFAULT)
+        form.addRow("β (Madgwick)", self.orientation_beta_spin)
+        side.addLayout(form)
+
+        self.orientation_reject_check = QCheckBox("Rechazo de aceleración (§5.3)")
+        self.orientation_reject_check.setChecked(True)
+        side.addWidget(self.orientation_reject_check)
+
+        reject_form = QFormLayout()
+        self.orientation_tol_mag_spin = QDoubleSpinBox()
+        self.orientation_tol_mag_spin.setRange(0.1, 10.0)
+        self.orientation_tol_mag_spin.setSingleStep(0.1)
+        self.orientation_tol_mag_spin.setValue(imu.ACC_REJECT_TOL_MAG_DEFAULT)
+        reject_form.addRow("Tolerancia ||a|-|g|| (m/s²)", self.orientation_tol_mag_spin)
+
+        self.orientation_tol_ang_spin = QDoubleSpinBox()
+        self.orientation_tol_ang_spin.setRange(1.0, 45.0)
+        self.orientation_tol_ang_spin.setSingleStep(1.0)
+        self.orientation_tol_ang_spin.setValue(imu.ACC_REJECT_TOL_ANG_DEFAULT)
+        reject_form.addRow("Tolerancia ángulo (°)", self.orientation_tol_ang_spin)
+        side.addLayout(reject_form)
+
+        self.online_bias_check = QCheckBox("Re-bias automático en reposo (C4)")
+        self.online_bias_check.setChecked(True)
+        side.addWidget(self.online_bias_check)
+
+        self.o6_reference_check = QCheckBox("Superponer referencia O6 (anclas, no causal)")
+        side.addWidget(self.o6_reference_check)
+
+        self.orientation_status_label = QLabel("")
+        self.orientation_status_label.setWordWrap(True)
+        side.addWidget(self.orientation_status_label)
+
+        # E2/E3 (PLAN-V2.md §8) -- alongside the filter-bank exporter in
+        # the "Filtro de señal" section above.
+        export_row = QHBoxLayout()
+        self.export_mahony_btn = QPushButton("Export Mahony/Compl. (E2)")
+        self.export_mahony_btn.clicked.connect(self._on_export_mahony_clicked)
+        export_row.addWidget(self.export_mahony_btn)
+        self.export_madgwick_btn = QPushButton("Export Madgwick (E3)")
+        self.export_madgwick_btn.clicked.connect(self._on_export_madgwick_clicked)
+        export_row.addWidget(self.export_madgwick_btn)
+        side.addLayout(export_row)
+        return box
+
+    def _build_orientation_plots(self, plots_col: QVBoxLayout) -> None:
+        self.orientation_plots: List[pg.PlotWidget] = []
+        specs = [
+            ("roll", "Roll (°)"),
+            ("pitch", "Pitch (°)"),
+            ("yaw", "Yaw (°, no observable — deriva)"),
+            ("theta", "θ inclinación total (°)"),
+            ("leak", "Fuga de gravedad g(1-cosθ) (m/s²)"),
+            ("bias", "Bias de giro estimado (°/s)"),
+        ]
+        for _key, label in specs:
+            plot = pg.PlotWidget()
+            plot.setLabel("left", label)
+            plot.setLabel("bottom", "t (s)")
+            plot.showGrid(x=True, y=True, alpha=0.2)
+            if self.orientation_plots:
+                plot.setXLink(self.orientation_plots[0])
+            self.orientation_plots.append(plot)
+            plots_col.addWidget(plot)
+
+        self.orientation_curves = {
+            "roll": self.orientation_plots[0].plot([], [], pen=pg.mkPen((0, 200, 255), width=2)),
+            "pitch": self.orientation_plots[1].plot([], [], pen=pg.mkPen((0, 220, 120), width=2)),
+            "yaw": self.orientation_plots[2].plot([], [], pen=pg.mkPen((160, 160, 160), width=2)),
+            "theta": self.orientation_plots[3].plot([], [], pen=pg.mkPen((255, 180, 0), width=2), name="causal"),
+            "theta_o6": self.orientation_plots[3].plot(
+                [], [], pen=pg.mkPen((255, 80, 255), width=2, style=Qt.PenStyle.DotLine), name="O6 (referencia)"
+            ),
+            "leak": self.orientation_plots[4].plot([], [], pen=pg.mkPen((255, 80, 80), width=2)),
+            "bias_x": self.orientation_plots[5].plot([], [], pen=pg.mkPen((255, 80, 80), width=1), name="x"),
+            "bias_y": self.orientation_plots[5].plot([], [], pen=pg.mkPen((80, 255, 80), width=1), name="y"),
+            "bias_z": self.orientation_plots[5].plot([], [], pen=pg.mkPen((80, 80, 255), width=1), name="z"),
+        }
+        self.orientation_plots[3].addLegend()
+        self.orientation_plots[5].addLegend()
+        self.orientation_reject_regions: list = []
+
+    def _refresh_orientation(self) -> None:
+        grid = self._current_grid
+        if grid is None:
+            return
+        sl = self._visible_slice(grid.fs, len(grid.t))
+        t_vis = grid.t[sl]
+
+        if not dsp.gyro_available(grid) or self.calib is None:
+            for curve in self.orientation_curves.values():
+                curve.setData([], [])
+            self.orientation_status_label.setText(
+                "Sin giroscopio (paquete v1)." if not dsp.gyro_available(grid) else 'Falta "Capturar reposo" en la pestaña Velocity.'
+            )
+            return
+
+        orient = self._advance_orientation(grid)
+        if orient is None:
+            for curve in self.orientation_curves.values():
+                curve.setData([], [])
+            self.orientation_status_label.setText("Orientación no disponible todavía.")
+            return
+
+        quats, accepted, bias = orient
+        q0 = imu.tilt_quat(*self.calib.bias)
+
+        n = len(quats)
+        roll = np.empty(n)
+        pitch = np.empty(n)
+        yaw = np.empty(n)
+        theta = np.empty(n)
+        for i in range(n):
+            q = tuple(quats[i])
+            roll[i], pitch[i], yaw[i] = imu.quat_to_euler_deg(q)
+            theta[i] = imu.tilt_angle(q, q0)
+        leak = -self.calib.g_mag * (1.0 - np.cos(np.radians(theta)))
+
+        self.orientation_curves["roll"].setData(t_vis, roll[sl])
+        self.orientation_curves["pitch"].setData(t_vis, pitch[sl])
+        self.orientation_curves["yaw"].setData(t_vis, yaw[sl])
+        self.orientation_curves["theta"].setData(t_vis, theta[sl])
+        self.orientation_curves["leak"].setData(t_vis, leak[sl])
+        self.orientation_curves["bias_x"].setData(t_vis, np.degrees(bias[sl, 0]))
+        self.orientation_curves["bias_y"].setData(t_vis, np.degrees(bias[sl, 1]))
+        self.orientation_curves["bias_z"].setData(t_vis, np.degrees(bias[sl, 2]))
+
+        # Shade where the accel measurement was rejected (PLAN-V2.md §5.3),
+        # same treatment as Accel's interpolated regions.
+        for item in self.orientation_reject_regions:
+            self.orientation_plots[3].removeItem(item)
+        self.orientation_reject_regions.clear()
+        for start, end in _find_runs(~accepted[sl]):
+            region = pg.LinearRegionItem(values=(t_vis[start], t_vis[end]), movable=False, brush=pg.mkBrush(255, 80, 80, 40))
+            region.setZValue(-10)
+            self.orientation_plots[3].addItem(region)
+            self.orientation_reject_regions.append(region)
+
+        if self.o6_reference_check.isChecked():
+            a_vert_fixed = dsp.project_vertical(grid.ax, grid.ay, grid.az, self.calib)
+            rest_intervals = self._rest_intervals(grid, a_vert_fixed)
+            gyr = np.stack([grid.gx, grid.gy, grid.gz], axis=1)
+            acc = np.stack([grid.ax, grid.ay, grid.az], axis=1)
+            anchored = imu.integrate_between_rest_anchors(acc, gyr, 1.0 / grid.fs, rest_intervals, len(grid.t))
+            theta_o6 = np.full(len(grid.t), np.nan)
+            for i in np.nonzero(np.all(np.isfinite(anchored), axis=1))[0]:
+                theta_o6[i] = imu.tilt_angle(tuple(anchored[i]), q0)
+            self.orientation_curves["theta_o6"].setData(t_vis, theta_o6[sl])
+        else:
+            self.orientation_curves["theta_o6"].setData([], [])
+
+        n_rejected = int(np.count_nonzero(~accepted))
+        self.orientation_status_label.setText(
+            f"θ actual: {theta[-1]:.2f}°  ·  bias giro: ({math.degrees(bias[-1, 0]):.2f}, "
+            f"{math.degrees(bias[-1, 1]):.2f}, {math.degrees(bias[-1, 2]):.2f}) °/s  ·  "
+            f"{n_rejected}/{len(accepted)} muestras con aceleración rechazada"
+        )
+
+    # -- Sensor / thermal group (merged into the Filters tab) -----------------
+
+    def _build_sensor_group(self) -> QGroupBox:
+        box = QGroupBox("Sensor / térmica")
+        side = QVBoxLayout(box)
+        self.sensor_status_label = QLabel("")
+        self.sensor_status_label.setWordWrap(True)
+        side.addWidget(self.sensor_status_label)
+
+        side.addWidget(QLabel("Eje a ajustar (bias vs T):"))
+        self.thermal_axis_combo = QComboBox()
+        for axis in ("ax", "ay", "az", "gx", "gy", "gz"):
+            self.thermal_axis_combo.addItem(axis, axis)
+        side.addWidget(self.thermal_axis_combo)
+
+        self.thermal_fit_btn = QPushButton("Ajustar térmica (C6/A5, grabación completa)")
+        self.thermal_fit_btn.clicked.connect(self._on_thermal_fit_clicked)
+        side.addWidget(self.thermal_fit_btn)
+        self.thermal_fit_label = QLabel("")
+        self.thermal_fit_label.setWordWrap(True)
+        side.addWidget(self.thermal_fit_label)
+
+        self.allan_fit_btn = QPushButton("Calcular Allan (A4, grabación completa)")
+        self.allan_fit_btn.clicked.connect(self._on_allan_clicked)
+        side.addWidget(self.allan_fit_btn)
+        self.allan_label = QLabel("")
+        self.allan_label.setWordWrap(True)
+        side.addWidget(self.allan_label)
+
+        self.export_thermal_btn = QPushButton("Export corrección térmica (E4)")
+        self.export_thermal_btn.clicked.connect(self._on_export_thermal_clicked)
+        side.addWidget(self.export_thermal_btn)
+        return box
+
+    def _build_sensor_plots(self, plots_col: QVBoxLayout) -> None:
+        self.temp_plot = pg.PlotWidget()
+        self.temp_plot.setLabel("left", "T (°C)")
+        self.temp_plot.setLabel("bottom", "t (s)")
+        self.temp_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.temp_curve = self.temp_plot.plot([], [], pen=pg.mkPen((255, 150, 0), width=2))
+        plots_col.addWidget(self.temp_plot)
+
+        self.thermal_scatter_plot = pg.PlotWidget()
+        self.thermal_scatter_plot.setLabel("left", "Bias (unidad del eje elegido)")
+        self.thermal_scatter_plot.setLabel("bottom", "T (°C)")
+        self.thermal_scatter_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.thermal_scatter_curve = self.thermal_scatter_plot.plot(
+            [], [], pen=None, symbol="o", symbolSize=5, symbolBrush=(0, 200, 255)
+        )
+        self.thermal_fit_curve = self.thermal_scatter_plot.plot([], [], pen=pg.mkPen((255, 80, 80), width=2))
+        plots_col.addWidget(self.thermal_scatter_plot)
+
+        self.allan_plot = pg.PlotWidget()
+        self.allan_plot.setLogMode(x=True, y=True)
+        self.allan_plot.setLabel("left", "ADEV")
+        self.allan_plot.setLabel("bottom", "τ (s)")
+        self.allan_plot.showGrid(x=True, y=True, alpha=0.2)
+        colors = {
+            "ax": (255, 80, 80), "ay": (80, 255, 80), "az": (80, 80, 255),
+            "gx": (255, 180, 0), "gy": (0, 220, 255), "gz": (220, 0, 220),
+        }
+        self.allan_curves = {axis: self.allan_plot.plot([], [], pen=pg.mkPen(color, width=2), name=axis) for axis, color in colors.items()}
+        self.allan_plot.addLegend()
+        plots_col.addWidget(self.allan_plot)
+
+    def _refresh_sensor(self) -> None:
+        grid = self._current_grid
+        if grid is None:
+            return
+        sl = self._visible_slice(grid.fs, len(grid.t))
+        if not dsp.gyro_available(grid):
+            self.temp_curve.setData([], [])
+            self.sensor_status_label.setText("Esta captura no trae temperatura (paquete v1).")
+            return
+
+        self.temp_curve.setData(grid.t[sl], grid.temp_c[sl])
+
+        # C5a — warm-up guard: dT/dt over the trailing 10s.
+        window = max(1, int(round(10.0 * grid.fs)))
+        if len(grid.temp_c) > window:
+            dTdt_c_per_min = (grid.temp_c[-1] - grid.temp_c[-window]) / (window / grid.fs) * 60.0
+            status = f"T actual: {grid.temp_c[-1]:.2f}°C  ·  dT/dt: {dTdt_c_per_min:+.2f} °C/min"
+            if abs(dTdt_c_per_min) > 0.2:
+                status += "  ⚠ sensor en calentamiento — la calibración va a envejecer rápido"
+        else:
+            status = f"T actual: {grid.temp_c[-1]:.2f}°C"
+        self.sensor_status_label.setText(status)
+
+    def _on_thermal_fit_clicked(self) -> None:
+        grid = self._current_grid
+        if grid is None or not dsp.gyro_available(grid):
+            QMessageBox.warning(self, "Ajuste térmico", "Hace falta una captura v2 con temperatura.")
+            return
+        axis = self.thermal_axis_combo.currentData()
+        x = getattr(grid, axis)
+        fit = imu.thermal_fit(grid.temp_c, x, fs=grid.fs)
+        if fit is None:
+            self.thermal_fit_label.setText(
+                "No se pudo ajustar: hace falta una grabación larga (varios minutos) con la temperatura variando de verdad."
+            )
+            self.thermal_scatter_curve.setData([], [])
+            self.thermal_fit_curve.setData([], [])
+            return
+
+        self._thermal_fits[axis] = fit
+
+        window = max(1, int(round(10.0 * grid.fs)))
+        n_windows = len(grid.temp_c) // window
+        t_w = grid.temp_c[: n_windows * window].reshape(n_windows, window).mean(axis=1)
+        x_w = x[: n_windows * window].reshape(n_windows, window).mean(axis=1)
+        self.thermal_scatter_curve.setData(t_w, x_w)
+        t_line = np.linspace(float(np.min(t_w)), float(np.max(t_w)), 50)
+        self.thermal_fit_curve.setData(t_line, fit.slope * t_line + fit.intercept)
+        self.thermal_fit_label.setText(
+            f"{axis}: pendiente={fit.slope:.6f}/°C  ·  R²={fit.r2:.3f}  ·  RMS residuo={fit.rms_residual:.4f}"
+            + ("" if fit.r2 >= 0.8 else "  (R² < 0.8 -- no se recomienda exportar E4 para este eje)")
+        )
+
+    def _on_allan_clicked(self) -> None:
+        grid = self._current_grid
+        if grid is None or not dsp.gyro_available(grid):
+            QMessageBox.warning(self, "Allan", "Hace falta una captura v2 con giroscopio.")
+            return
+        lines = []
+        for axis, curve in self.allan_curves.items():
+            y = getattr(grid, axis)
+            taus, adev = imu.oadev(y, grid.fs)
+            curve.setData(taus, adev)
+            if len(adev):
+                bias_inst, tau_min = imu.bias_instability(taus, adev)
+                lines.append(f"{axis}: ADEV(τ_min)={adev[int(np.argmin(adev))]:.5f}  ·  inestabilidad≈{bias_inst:.5f} @ τ={tau_min:.1f}s")
+        self.allan_label.setText("\n".join(lines))
 
 
 def main() -> None:
