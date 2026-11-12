@@ -14,6 +14,8 @@ import { connectAndPrepare, manager, monitorSamples, requestBlePermissions } fro
 import { parsePacket, SERVICE_UUID, type VbtSample } from './protocol';
 import { SIM_HZ, simulateSquatSession } from './sim';
 import { analyzeSet } from './reps';
+import { buildStoredSet } from './session';
+import { saveSet } from './store';
 import { createVbtProcessor, type LiveState, type RawSample, type Rep, type RejectedRep } from './vbt';
 
 export type LogRow =
@@ -154,6 +156,7 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   const deviceRef = useRef<Device | null>(null);
   const pausedRef = useRef(false);
   const lastCountAt = useRef(0);
+  const demoRef = useRef(false);
 
   // Refs are only for the unmount-cleanup and 100ms-ticker effects below to
   // read the latest value without depending on it — never mutate a ref
@@ -164,6 +167,9 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     pausedRef.current = paused;
   }, [paused]);
+  useEffect(() => {
+    demoRef.current = demo;
+  }, [demo]);
 
   const reset = useCallback(() => {
     buf.current = freshBuffer();
@@ -288,6 +294,15 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     // displacement-based detector (reps.ts) is used here: the streaming FSM in
     // vbt.ts reads slow reps as "still" and misses them (see scripts/bench.ts).
     const { reps, rejected, session } = analyzeSet(rec.samples);
+
+    // Every recorded set is kept on the phone (raw CSV + analysis), so it can be
+    // reviewed later, compared, exported or re-analyzed. A failure to write must
+    // never lose the set on screen, so it only raises a notice.
+    try {
+      saveSet(buildStoredSet(rec.samples, { source: demoRef.current ? 'demo' : 'sensor', createdAt: rec.startedAt }), rec.samples);
+    } catch (e) {
+      setNotice(`No se pudo guardar la serie: ${e instanceof Error ? e.message : String(e)}`);
+    }
     const conMeans = reps.map((r) => r.meanConcentricVelocity);
     const conAccels = reps.map((r) => r.peakConcentricVelocity / Math.max(0.001, r.timeToPeakMs / 1000));
 
