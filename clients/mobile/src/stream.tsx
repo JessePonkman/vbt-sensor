@@ -12,7 +12,9 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { Device, State as AdapterState } from 'react-native-ble-plx';
 import { connectAndPrepare, manager, monitorSamples, requestBlePermissions } from './ble';
 import { parsePacket, SERVICE_UUID, type VbtSample } from './protocol';
-import { analyzeSession, createVbtProcessor, type LiveState, type RawSample, type Rep, type RejectedRep } from './vbt';
+import { SIM_HZ, simulateSquatSession } from './sim';
+import { analyzeSet } from './reps';
+import { createVbtProcessor, type LiveState, type RawSample, type Rep, type RejectedRep } from './vbt';
 
 export type LogRow =
   | { key: string; kind: 'sample'; sample: VbtSample }
@@ -41,6 +43,7 @@ const LOG_SIZE = 200;
 const TICK_MS = 100;
 const RATE_WINDOW_MS = 1000;
 const LIVE_WINDOW_S = 3;
+const REP_COUNT_EVERY_MS = 2000;
 
 // --- ConnCtx: changes only on user action / BLE event ----------------------
 
@@ -54,6 +57,7 @@ type ConnState = {
   rssi: number | null;
   sets: SetData[];
   isRecording: boolean;
+  demo: boolean; // true while replaying the built-in simulator instead of a BLE sensor
 };
 
 type ConnActions = {
@@ -63,6 +67,8 @@ type ConnActions = {
   startSet: () => void;
   endSet: () => void;
   recalibrate: () => void;
+  startDemo: () => void;
+  stopDemo: () => void;
 };
 
 const ConnCtx = createContext<(ConnState & ConnActions) | null>(null);
@@ -137,6 +143,7 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [sets, setSets] = useState<SetData[]>([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [demo, setDemo] = useState(false);
 
   const [tick, setTick] = useState<LiveTick>(EMPTY_TICK);
   const [paused, setPaused] = useState(false);
@@ -146,6 +153,7 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   const intentionalDisconnectRef = useRef(false);
   const deviceRef = useRef<Device | null>(null);
   const pausedRef = useRef(false);
+  const lastCountAt = useRef(0);
 
   // Refs are only for the unmount-cleanup and 100ms-ticker effects below to
   // read the latest value without depending on it — never mutate a ref
@@ -236,11 +244,31 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     [reset]
   );
 
+  const startDemo = useCallback(() => {
+    setNotice(null);
+    reset();
+    setSets([]);
+    setIsRecording(false);
+    setDemo(true);
+    setAppState('connected');
+  }, [reset]);
+
+  const stopDemo = useCallback(() => {
+    setDemo(false);
+    setIsRecording(false);
+    setAppState('idle');
+    setNotice(null);
+  }, []);
+
   const disconnect = useCallback(() => {
+    if (demo) {
+      stopDemo();
+      return;
+    }
     if (!device) return;
     intentionalDisconnectRef.current = true;
     device.cancelConnection().catch(() => {});
-  }, [device]);
+  }, [device, demo, stopDemo]);
 
   const startSet = useCallback(() => {
     if (buf.current.rec) return;
@@ -256,8 +284,10 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
 
     // Re-analyze the full recorded sample array in one batch pass, fresh —
     // this is what makes the table and the velocity chart exactly agree
-    // (PLAN-V2.md §4.3), rather than reconciling the live estimate.
-    const { reps, rejected, session } = analyzeSession(rec.samples);
+    // (PLAN-V2.md §4.3), rather than reconciling the live estimate. The
+    // displacement-based detector (reps.ts) is used here: the streaming FSM in
+    // vbt.ts reads slow reps as "still" and misses them (see scripts/bench.ts).
+    const { reps, rejected, session } = analyzeSet(rec.samples);
     const conMeans = reps.map((r) => r.meanConcentricVelocity);
     const conAccels = reps.map((r) => r.peakConcentricVelocity / Math.max(0.001, r.timeToPeakMs / 1000));
 
@@ -284,6 +314,52 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     buf.current.proc.reset();
   }, []);
 
+  // The single entry point for a decoded packet, whatever produced it (BLE
+  // notification or the demo simulator). Everything downstream — the loss
+  // counter, the live window, the VBT processor, set recording — is shared,
+  // so demo mode exercises exactly the code a real sensor would.
+  const ingest = useCallback((sample: VbtSample) => {
+    const last = buf.current.lastSeq;
+    if (last !== null && sample.sequence > last + 1) {
+      const gap = sample.sequence - last - 1;
+      buf.current.lost += gap;
+      buf.current.rows.push({ key: `gap-${last}`, kind: 'gap', afterSequence: last, count: gap });
+    }
+    // sample.sequence <= last means the ESP32 rebooted (its counter
+    // restarts at 0) — just resync below instead of counting loss.
+    buf.current.lastSeq = sample.sequence;
+
+    buf.current.packets += 1;
+    buf.current.rxTimes.push(sample.rxAt);
+
+    buf.current.rows.push({ key: String(sample.sequence), kind: 'sample', sample });
+    if (buf.current.rows.length > LOG_SIZE) buf.current.rows.splice(0, buf.current.rows.length - LOG_SIZE);
+
+    buf.current.proc.push(sample);
+    const live = buf.current.proc.live;
+    buf.current.proc.takeReps(); // drain the streaming FSM's reps; the set's real numbers come from analyzeSet
+    if (buf.current.rec) buf.current.rec.samples.push(sample);
+
+    const win = buf.current.win;
+    win.t.push(sample.rxAt / 1000);
+    win.ax.push(sample.ax);
+    win.ay.push(sample.ay);
+    win.az.push(sample.az);
+    win.a.push(live.aVert);
+    win.v.push(live.vVert);
+    const cutoff = sample.rxAt / 1000 - LIVE_WINDOW_S;
+    let cut = 0;
+    while (cut < win.t.length && win.t[cut] < cutoff) cut++;
+    if (cut > 0) {
+      win.t.splice(0, cut);
+      win.ax.splice(0, cut);
+      win.ay.splice(0, cut);
+      win.az.splice(0, cut);
+      win.a.splice(0, cut);
+      win.v.splice(0, cut);
+    }
+  }, []);
+
   // Subscribe to the connected device's notifications.
   useEffect(() => {
     if (!device) return;
@@ -296,59 +372,44 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
           buf.current.malformed += 1;
           return;
         }
-
-        const last = buf.current.lastSeq;
-        if (last !== null && sample.sequence > last + 1) {
-          const gap = sample.sequence - last - 1;
-          buf.current.lost += gap;
-          buf.current.rows.push({ key: `gap-${last}`, kind: 'gap', afterSequence: last, count: gap });
-        }
-        // sample.sequence <= last means the ESP32 rebooted (its counter
-        // restarts at 0) — just resync below instead of counting loss.
-        buf.current.lastSeq = sample.sequence;
-
-        buf.current.packets += 1;
-        buf.current.rxTimes.push(sample.rxAt);
-
-        buf.current.rows.push({ key: String(sample.sequence), kind: 'sample', sample });
-        if (buf.current.rows.length > LOG_SIZE) buf.current.rows.splice(0, buf.current.rows.length - LOG_SIZE);
-
-        buf.current.proc.push(sample);
-        const live = buf.current.proc.live;
-        const { reps: newlyClosed } = buf.current.proc.takeReps(); // drain; End set re-derives the real numbers
-        if (buf.current.rec) {
-          buf.current.rec.samples.push(sample);
-          buf.current.rec.repCount += newlyClosed.length;
-        }
-
-        const win = buf.current.win;
-        win.t.push(sample.rxAt / 1000);
-        win.ax.push(sample.ax);
-        win.ay.push(sample.ay);
-        win.az.push(sample.az);
-        win.a.push(live.aVert);
-        win.v.push(live.vVert);
-        const cutoff = sample.rxAt / 1000 - LIVE_WINDOW_S;
-        let cut = 0;
-        while (cut < win.t.length && win.t[cut] < cutoff) cut++;
-        if (cut > 0) {
-          win.t.splice(0, cut);
-          win.ax.splice(0, cut);
-          win.ay.splice(0, cut);
-          win.az.splice(0, cut);
-          win.a.splice(0, cut);
-          win.v.splice(0, cut);
-        }
+        ingest(sample);
       },
       (error) => setNotice(error.message)
     );
 
     return () => subscription.remove();
-  }, [device]);
+  }, [device, ingest]);
+
+  // Demo mode: replay a simulated session (walkout -> set -> re-rack) at real
+  // time, 100 Hz, through the same ingest() path as real BLE packets.
+  useEffect(() => {
+    if (!demo) return;
+
+    const { samples } = simulateSquatSession();
+    const startedAt = Date.now();
+    let next = 0;
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const due = Math.floor(((now - startedAt) / 1000) * SIM_HZ);
+      while (next < samples.length && samples[next].sequence <= due) {
+        const s = samples[next++];
+        // rxAt is stamped at "arrival": derive it from the sample's own slot so
+        // a late timer tick doesn't bunch packets up and distort the Hz readout.
+        ingest({ ...s, version: 2, rxAt: startedAt + s.sequence * (1000 / SIM_HZ), raw: new Uint8Array(0) });
+      }
+      if (next >= samples.length) {
+        clearInterval(interval);
+        setNotice('Demo terminada');
+      }
+    }, 20);
+
+    return () => clearInterval(interval);
+  }, [demo, ingest]);
 
   // Publish buffer -> state at 10fps, independent of the incoming packet rate.
   useEffect(() => {
-    if (!device) return;
+    if (!device && !demo) return;
 
     const interval = setInterval(() => {
       const cutoff = Date.now() - RATE_WINDOW_MS;
@@ -356,6 +417,14 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
       const rateHz = buf.current.rxTimes.length / (RATE_WINDOW_MS / 1000);
       const live = buf.current.proc.live;
       const rec = buf.current.rec;
+
+      // Live rep counter: re-run the batch detector over the set so far every
+      // 2 s (~3 ms for a typical set on a laptop). A rep counts once it is
+      // complete, so the number lags the lifter by about a rep's tail.
+      if (rec && Date.now() - lastCountAt.current >= REP_COUNT_EVERY_MS) {
+        lastCountAt.current = Date.now();
+        rec.repCount = analyzeSet(rec.samples).reps.length;
+      }
 
       setTick((prev) => ({
         rows: pausedRef.current ? prev.rows : [...buf.current.rows].reverse(),
@@ -377,7 +446,7 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     }, TICK_MS);
 
     return () => clearInterval(interval);
-  }, [device]);
+  }, [device, demo]);
 
   const togglePause = useCallback(() => setPaused((p) => !p), []);
 
@@ -397,14 +466,17 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
       rssi,
       sets,
       isRecording,
+      demo,
       scan,
       select,
       disconnect,
       startSet,
       endSet,
       recalibrate,
+      startDemo,
+      stopDemo,
     }),
-    [appState, adapterState, permissionDenied, notice, devices, device, rssi, sets, isRecording, scan, select, disconnect, startSet, endSet, recalibrate]
+    [appState, adapterState, permissionDenied, notice, devices, device, rssi, sets, isRecording, demo, scan, select, disconnect, startSet, endSet, recalibrate, startDemo, stopDemo]
   );
 
   return (

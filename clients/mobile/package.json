@@ -25,7 +25,8 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "test": "node --test src/*.test.ts",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "bench": "node scripts/bench.ts"
   },
   "private": true
 }

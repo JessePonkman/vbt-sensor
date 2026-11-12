@@ -4,12 +4,12 @@
 
 import { Linking, PermissionsAndroid, Platform } from 'react-native';
 import { BleError, BleManager, Device, Subscription } from 'react-native-ble-plx';
-import { CHARACTERISTIC_UUID, SERVICE_UUID } from './protocol';
+import { CHARACTERISTIC_UUID, MIN_PACKET_MTU, SERVICE_UUID } from './protocol';
 
 export const manager = new BleManager();
 
-// 22-byte packet + 3-byte ATT header. Below this, notifications get truncated.
-const MIN_USABLE_MTU = 25;
+// Largest packet (v2, 42 bytes) + 3-byte ATT header. Below this, notifications get truncated.
+const MIN_USABLE_MTU = MIN_PACKET_MTU;
 const REQUESTED_MTU = 247;
 
 export async function requestBlePermissions(): Promise<boolean> {
@@ -35,7 +35,7 @@ export function openAppSettings(): void {
 }
 
 /** Connects, negotiates MTU, and discovers services/characteristics.
- * Throws if the negotiated MTU can't fit a 22-byte packet (see PLAN.md §1.2a). */
+ * Throws if the negotiated MTU can't fit a v2 packet (see PLAN.md §1.2a). */
 export async function connectAndPrepare(deviceId: string): Promise<Device> {
   const connected = await manager.connectToDevice(deviceId, { requestMTU: REQUESTED_MTU });
 

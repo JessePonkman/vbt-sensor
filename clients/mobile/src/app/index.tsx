@@ -34,10 +34,10 @@ export default function LiveScreen() {
     <View style={ui.screen}>
       <StatusBar style="light" />
 
-      {conn.appState === 'connected' && conn.device && (
+      {conn.appState === 'connected' && (conn.device || conn.demo) && (
         <View style={styles.subHeader}>
-          <Text style={styles.subHeaderText}>{conn.device.name ?? conn.device.id}</Text>
-          <Text style={styles.subHeaderText}>{conn.rssi !== null ? `${conn.rssi} dBm` : '— dBm'}</Text>
+          <Text style={styles.subHeaderText}>{conn.demo ? 'DEMO (simulador)' : conn.device?.name ?? conn.device?.id}</Text>
+          <Text style={styles.subHeaderText}>{conn.demo ? 'sin sensor' : conn.rssi !== null ? `${conn.rssi} dBm` : '— dBm'}</Text>
           <Text style={styles.subHeaderText}>{live.stats.rateHz.toFixed(1)} Hz</Text>
         </View>
       )}
@@ -60,6 +60,10 @@ export default function LiveScreen() {
             ) : (
               <Text style={ui.primaryButtonText}>Scan for devices</Text>
             )}
+          </TouchableOpacity>
+
+          <TouchableOpacity style={ui.secondaryButton} onPress={conn.startDemo} disabled={conn.appState === 'connecting'}>
+            <Text style={ui.secondaryButtonText}>Probar con el simulador (sin sensor)</Text>
           </TouchableOpacity>
 
           {conn.appState === 'connecting' && <Text style={ui.hint}>Conectando…</Text>}
@@ -89,7 +93,7 @@ export default function LiveScreen() {
         </View>
       )}
 
-      {conn.appState === 'connected' && conn.device && <LivePanel />}
+      {conn.appState === 'connected' && (conn.device || conn.demo) && <LivePanel />}
     </View>
   );
 }
@@ -159,7 +163,7 @@ function LivePanel() {
 
       <View style={styles.footer}>
         <TouchableOpacity style={ui.dangerButton} onPress={conn.disconnect}>
-          <Text style={ui.secondaryButtonText}>Disconnect</Text>
+          <Text style={ui.secondaryButtonText}>{conn.demo ? 'Salir del simulador' : 'Disconnect'}</Text>
         </TouchableOpacity>
       </View>
     </>
