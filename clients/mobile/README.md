@@ -1,48 +1,58 @@
-# VBT Sensor — Mobile (Android)
+# VBT Sensor — Mobile
 
-React Native (Expo) app that connects to the VBT ESP32-S3 over BLE, subscribes to its
-accelerometer data characteristic, integrates it into bar velocity, and shows live and
-per-set velocity-based-training metrics for the back squat.
+React Native (Expo) app for velocity-based training with the VBT ESP32-S3 sensor: record a
+set between your own Start / End marks, then review it — reps, mean and peak velocity,
+velocity loss, range of motion, charts — and keep a history on the phone. Back squat for now.
 
-See [PLAN-V2.md](./PLAN-V2.md) for the full design/spec this iteration was built against
-(and [PLAN.md](./PLAN.md) for the original raw-stream MVP it replaces).
+Runs on Android (the target) and iOS from the same code; the browser version is a preview
+that uses the built-in simulator instead of the sensor.
 
-## Prerequisites
+See [BENCH.md](./BENCH.md) for how well reps are detected and what that does and does not
+prove, and [PLAN-V2.md](./PLAN-V2.md) / [PLAN.md](./PLAN.md) for the original design notes
+(older than the current screens).
 
-- Node.js and npm.
-- **A physical Android device.** BLE does not work on the Android emulator — you need a real
-  phone with USB debugging enabled (or over Wi-Fi via `adb`).
-- Android SDK + a JDK, for the native build (`expo prebuild` / `expo run:android`). Not needed
-  just to read/edit the TypeScript source.
-- The ESP32-S3 flashed with the firmware in `../../firmware` (100 Hz as of this iteration) and
-  powered on.
-
-BLE is native code, so **this app does not run in Expo Go** — it needs a dev client build.
-
-## Running it
+## Quick start
 
 ```bash
-npm install
+npm ci            # exactly the versions in package-lock.json
+npm test          # 64 tests, no hardware needed
+npx expo start --web    # look at the app in a browser (simulator instead of the sensor)
+```
+
+Use `npm ci`. **Do not run `npm install --legacy-peer-deps`**: it silently drops packages the
+app needs (`expo-linking`, the Babel preset, ...) and the bundle then fails. To add a package,
+use `npx expo install <package> -- --force`.
+
+## On a phone
+
+- **A physical device.** BLE does not work in an emulator or a browser.
+- Android SDK and a JDK for the native build (React Native expects JDK 17).
+- The ESP32-S3 flashed with the firmware in `../../firmware` (protocol v2) and powered on.
+
+BLE and the file system are native code, so **this app does not run in Expo Go** — it needs
+a development build:
+
+```bash
 npx expo prebuild --platform android   # generates the android/ folder (CNG)
 npx expo run:android                   # builds and installs the dev client on a connected device
 ```
 
-⚠️ **This iteration added native modules** (`expo-router`, `react-native-safe-area-context`,
-`react-native-screens`, `react-native-svg`). If you have an older dev client installed, rebuild it
-with `npx expo run:android` again — `npx expo start` alone against a stale client will fail at
-runtime with a missing-native-module error.
+⚠️ **This iteration added native modules** (`expo-file-system`, `expo-sharing`,
+`expo-system-ui`; before that `expo-router`, `react-native-safe-area-context`,
+`react-native-screens`, `react-native-svg`). An older dev client will fail at runtime with a
+missing-native-module error: rebuild it with `npx expo run:android`.
 
-For subsequent runs, once the dev client is installed on the device:
+Once the dev client is installed, `npx expo start` is enough.
 
-```bash
-npx expo start
-```
+**Nothing in this repo has been run on a physical phone yet** — Bluetooth, saving to disk and
+the share sheet are covered by types, tests and a bundle build, not by a device. The first
+session on real hardware is the real test.
 
 ## Verifying without building
 
 ```bash
 npx tsc --noEmit   # typecheck
-npm test           # runs src/protocol.test.ts and src/vbt.test.ts — no hardware needed
+npm test           # protocol, detector, orientation, storage, simulator — no hardware needed
 npx expo lint      # lint
 ```
 
