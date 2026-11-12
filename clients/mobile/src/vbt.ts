@@ -19,6 +19,10 @@ export type RawSample = {
   ay: number;
   az: number;
   sequence: number;
+  // v2 packets only. Optional so v1 data and every existing test still type-check.
+  gx?: number; // rad/s
+  gy?: number;
+  gz?: number;
 };
 
 export type Calibration = { ux: number; uy: number; uz: number; gMag: number };

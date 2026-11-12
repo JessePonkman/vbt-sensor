@@ -29,6 +29,9 @@
 // Like vbt.ts: zero runtime imports (the type import is erased), so node's
 // test runner can load it.
 
+// Node's test runner needs the explicit .ts extension for a runtime import (see
+// the note in vbt.test.ts); tsconfig allows it, and Metro resolves the file.
+import { fuseOrientation, gravityBody, MAHONY_DEFAULTS, tiltQuat } from './orientation.ts';
 import type { Calibration, PhaseMetrics, RawSample, Rep, RejectedRep, SessionTrace } from './vbt';
 
 export type RepProfile = {
@@ -40,6 +43,17 @@ export type RepProfile = {
   repMaxMs: number;
   /** Swing needed between neighbouring extrema to be considered a rep at all. */
   swingM: number;
+  /** Each phase (down, up) must itself cover this fraction of romMinM. The
+   *  window-wide range alone lets drift over a long, noisy stretch pass. */
+  phaseRomFrac: number;
+  /** In a set of 3+ reps, drop a rep whose travel is under this fraction of
+   *  the set's median: reps of one set are the same exercise. */
+  setRomFrac: number;
+  /** Where a phase starts/ends: the bar counts as "moving" above this fraction
+   *  of the phase's own peak velocity, clamped to [moveFloor, moveCeil] m/s. */
+  moveFrac: number;
+  moveFloor: number;
+  moveCeil: number;
 };
 
 export const SQUAT_PROFILE: RepProfile = {
@@ -50,6 +64,11 @@ export const SQUAT_PROFILE: RepProfile = {
   repMinMs: 500,
   repMaxMs: 30_000, // a 6 s grind plus a 4 s pause still fits with room to spare
   swingM: 0.12,
+  phaseRomFrac: 0.6,
+  setRomFrac: 0.5,
+  moveFrac: 0.03,
+  moveFloor: 0.012,
+  moveCeil: 0.04,
 };
 
 /** Seconds of assumed stillness added before and after every recorded segment. */
@@ -63,6 +82,16 @@ export type SetAnalysis = {
   rejected: RejectedRep[];
   calibration: Calibration | null;
   session: SessionTrace;
+  /** Which tilt estimate fed the vertical axis: the gyroscope-fused one, or
+   *  the accelerometer-only average (v1 data, or `gyro: false`). */
+  orientation: 'gyro' | 'accel';
+};
+
+export type AnalyzeOptions = {
+  /** Use the gyroscope to track the bar's tilt when the packets carry it
+   *  (protocol v2). false forces the accelerometer-only path, which is what
+   *  v1 data gets anyway; scripts/bench.ts uses it for the before/after. */
+  gyro?: boolean;
 };
 
 // --- numeric helpers ---------------------------------------------------------
@@ -131,6 +160,10 @@ type Segment = {
   ax: number[];
   ay: number[];
   az: number[];
+  gx: number[]; // rad/s; NaN-free after gap filling, but only meaningful when hasGyro
+  gy: number[];
+  gz: number[];
+  hasGyro: boolean; // every received packet in the segment carried a gyroscope reading
   filled: boolean[]; // true where the packet never arrived and was interpolated
   fs: number;
   t0: number; // this segment's start, seconds from the first sample of the recording
@@ -179,15 +212,26 @@ function buildSegments(samples: readonly RawSample[]): Segment[] {
     const ax = new Array<number>(n).fill(NaN);
     const ay = new Array<number>(n).fill(NaN);
     const az = new Array<number>(n).fill(NaN);
+    const gx = new Array<number>(n).fill(NaN);
+    const gy = new Array<number>(n).fill(NaN);
+    const gz = new Array<number>(n).fill(NaN);
+    let hasGyro = true;
     for (const s of p) {
       const k = s.sequence - seq0;
       ax[k] = s.ax;
       ay[k] = s.ay;
       az[k] = s.az;
+      if (s.gx === undefined || s.gy === undefined || s.gz === undefined || !Number.isFinite(s.gx)) hasGyro = false;
+      else {
+        gx[k] = s.gx;
+        gy[k] = s.gy as number;
+        gz[k] = s.gz as number;
+      }
     }
     const filled = ax.map((v) => Number.isNaN(v));
     for (const arr of [ax, ay, az]) fillGaps(arr);
-    out.push({ t: Array.from({ length: n }, (_, k) => startAt[pi] + k / fs), ax, ay, az, filled, fs, t0: startAt[pi] });
+    if (hasGyro) for (const arr of [gx, gy, gz]) fillGaps(arr);
+    out.push({ t: Array.from({ length: n }, (_, k) => startAt[pi] + k / fs), ax, ay, az, gx, gy, gz, hasGyro, filled, fs, t0: startAt[pi] });
   });
   return out;
 }
@@ -210,10 +254,12 @@ function fillGaps(a: number[]): void {
  *  dynamic part cancels in direction), while the bar slowly tilting during
  *  the walkout is tracked — a fixed projection leaks horizontal acceleration
  *  into "vertical" as soon as the bar tilts. */
-function verticalAxis(seg: Segment): { aVert: number[]; gMag: number } {
+function verticalAxis(seg: Segment, useGyro: boolean): { aVert: number[]; gMag: number; fused: boolean } {
   const n = seg.ax.length;
   const mag = seg.ax.map((x, i) => Math.hypot(x, seg.ay[i], seg.az[i]));
   const gMag = median(mag);
+
+  if (useGyro && seg.hasGyro) return { aVert: fusedVertical(seg, gMag), gMag, fused: true };
 
   const win = Math.max(3, Math.round(1.5 * seg.fs)) | 1;
   const half = win >> 1;
@@ -237,7 +283,39 @@ function verticalAxis(seg: Segment): { aVert: number[]; gMag: number } {
     const gn = Math.hypot(gx, gy, gz) || 1;
     aVert[i] = (seg.ax[i] * gx + seg.ay[i] * gy + seg.az[i] * gz) / gn - gMag;
   }
-  return { aVert, gMag };
+  return { aVert, gMag, fused: false };
+}
+
+/** Vertical acceleration from the gyroscope-fused orientation: the Mahony
+ *  filter keeps g_hat(t) consistent with BOTH sensors, so the bar rolling
+ *  does not leak into the vertical channel and a sideways push is not
+ *  mistaken for a tilt. The filter starts from the tilt of the first
+ *  readings and, when the set starts at rest, from the gyroscope's resting
+ *  bias too. */
+function fusedVertical(seg: Segment, gMag: number): number[] {
+  const n = seg.ax.length;
+  const n0 = Math.min(n, Math.max(10, Math.round(0.8 * seg.fs)));
+  const mean = (a: number[]) => a.slice(0, n0).reduce((x, y) => x + y, 0) / n0;
+  const [mx, my, mz] = [mean(seg.ax), mean(seg.ay), mean(seg.az)];
+  const [mgx, mgy, mgz] = [mean(seg.gx), mean(seg.gy), mean(seg.gz)];
+
+  // Is the sensor actually still over that first stretch? Both a steady
+  // accelerometer and a (near) zero rotation rate, otherwise the "bias" would
+  // just be motion and subtracting it would hurt.
+  let spread = 0;
+  for (let i = 0; i < n0; i++) spread += (Math.hypot(seg.ax[i], seg.ay[i], seg.az[i]) - Math.hypot(mx, my, mz)) ** 2;
+  const still = Math.sqrt(spread / n0) < 0.2 && Math.hypot(mgx, mgy, mgz) < 0.1;
+
+  const quats = fuseOrientation(
+    seg.ax, seg.ay, seg.az, seg.gx, seg.gy, seg.gz, seg.fs,
+    { ...MAHONY_DEFAULTS, gRef: gMag },
+    still ? [mgx, mgy, mgz] : [0, 0, 0],
+    tiltQuat(mx, my, mz)
+  );
+  return quats.map((q, i) => {
+    const g = gravityBody(q);
+    return seg.ax[i] * g[0] + seg.ay[i] * g[1] + seg.az[i] * g[2] - gMag;
+  });
 }
 
 // --- 4. zigzag extrema ---------------------------------------------------------
@@ -351,17 +429,23 @@ function phase(t: readonly number[], v: readonly number[], s: readonly number[],
 
 // --- the detector ----------------------------------------------------------------
 
-export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = SQUAT_PROFILE): SetAnalysis {
+export function analyzeSet(
+  samples: readonly RawSample[],
+  profile: RepProfile = SQUAT_PROFILE,
+  opts: AnalyzeOptions = {}
+): SetAnalysis {
   const reps: Rep[] = [];
   const rejected: RejectedRep[] = [];
   const trace: SessionTrace = { t: [], ax: [], ay: [], az: [], v: [] };
   let calibration: Calibration | null = null;
+  let orientation: SetAnalysis['orientation'] = 'accel';
 
   for (const seg of buildSegments(samples)) {
     const n = seg.t.length;
     const fs = seg.fs;
     const dt = 1 / fs;
-    const { aVert, gMag } = verticalAxis(seg);
+    const { aVert, gMag, fused } = verticalAxis(seg, opts.gyro !== false);
+    if (fused) orientation = 'gyro';
     if (!calibration) {
       const c = Math.hypot(seg.ax[0], seg.ay[0], seg.az[0]) || 1;
       calibration = { ux: seg.ax[0] / c, uy: seg.ay[0] / c, uz: seg.az[0] / c, gMag };
@@ -385,8 +469,10 @@ export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = 
 
     const ext = zigzag(sHp, 0.06);
     const eps = Math.max(0.05, 5 * noiseFloor(aLp));
+    const sigmaA = noiseFloor(aVert); // raw accelerometer noise on the vertical axis, m/s^2
     const vTrace = new Array<number>(n).fill(0); // corrected velocity inside accepted reps, 0 elsewhere
     let prevEnd = -1; // padded index where the previous accepted rep's concentric ended
+    const cands: { rep: Rep; i0: number; v: number[]; m: number }[] = [];
 
     for (let k = 1; k + 1 < ext.length; k++) {
       if (ext[k].kind !== 'min' || ext[k - 1].kind !== 'max' || ext[k + 1].kind !== 'max') continue;
@@ -439,8 +525,8 @@ export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = 
         continue;
       }
 
-      // Phase boundaries from velocity. "Moving" means faster than 3% of the
-      // phase's own peak (clamped to 1.2-4 cm/s), so the same rule serves a
+      // Phase boundaries from velocity. "Moving" means faster than a fraction of
+      // the phase's own peak (profile.moveFrac, clamped), so the same rule serves a
       // 1.2 m/s speed rep and a 0.15 m/s grind, and the slow ease-in/out
       // tails stay inside the phase. Walking outward from the velocity peak
       // until it drops under that threshold also handles any bottom pause:
@@ -455,18 +541,41 @@ export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = 
         bad('return'); // the rise came before the descent: not a squat rep
         continue;
       }
-      const thrCon = Math.min(0.04, Math.max(0.012, 0.03 * v[conPeak]));
-      const thrEcc = Math.min(0.04, Math.max(0.012, -0.03 * v[eccPeak]));
+      // Integrated noise makes v wander by about 0.75 * sigma * sqrt(dt * T)
+      // over a window of length T (a Brownian bridge). A fixed threshold is
+      // fine for a quiet sensor on a short rep, but on a long, noisy one the
+      // wander alone crosses it and drags the phase boundaries around. So the
+      // floor grows with the noise and the window length; on a quiet sensor it
+      // stays below moveFloor and nothing changes.
+      const thrNoise = 0.75 * sigmaA * Math.sqrt(dt * span);
+      const lo = Math.max(profile.moveFloor, thrNoise);
+      const hi = Math.max(profile.moveCeil, lo);
+      const thrCon = Math.min(hi, Math.max(lo, profile.moveFrac * v[conPeak]));
+      const thrEcc = Math.min(hi, Math.max(lo, -profile.moveFrac * v[eccPeak]));
+      // A phase boundary needs the bar to be slow AND at the right height. A
+      // sticking point (the bar nearly stalls halfway up) is slow too, and
+      // must not end the concentric: only "slow near the bottom" can start
+      // the rise and only "slow near the top" can end it. "Near" = within a
+      // fifth of the travel.
+      let iBot = 0;
+      for (let q = 1; q < m; q++) if (s[q] < s[iBot]) iBot = q;
+      let sTopRef = s[iBot];
+      for (let q = iBot; q < m; q++) if (s[q] > sTopRef) sTopRef = s[q];
+      let sTop0 = s[0];
+      for (let q = 0; q <= iBot; q++) if (s[q] > sTop0) sTop0 = s[q];
+      const nearBottom = (q: number) => s[q] <= s[iBot] + 0.2 * (sTopRef - s[iBot]);
+      const nearTop = (q: number, top: number) => s[q] >= top - 0.2 * (top - s[iBot]);
+
       let conStart = conPeak;
-      while (conStart > eccPeak && v[conStart] > thrCon) conStart--;
+      while (conStart > eccPeak && !(v[conStart] <= thrCon && nearBottom(conStart))) conStart--;
       let conEnd = conPeak;
-      while (conEnd < m - 1 && v[conEnd] > thrCon) conEnd++;
+      while (conEnd < m - 1 && !(v[conEnd] <= thrCon && nearTop(conEnd, sTopRef))) conEnd++;
       let eccStart = eccPeak;
       // never reach back into the previous rep: with a noisy accelerometer the
       // velocity can sit below the threshold for longer than the real descent
-      while (eccStart > 0 && v[eccStart] < -thrEcc && (prevEnd < 0 || i0 + eccStart > prevEnd)) eccStart--;
+      while (eccStart > 0 && !(v[eccStart] >= -thrEcc && nearTop(eccStart, sTop0)) && (prevEnd < 0 || i0 + eccStart > prevEnd)) eccStart--;
       let eccEnd = eccPeak;
-      while (eccEnd < conStart && v[eccEnd] < -thrEcc) eccEnd++;
+      while (eccEnd < conStart && !(v[eccEnd] >= -thrEcc && nearBottom(eccEnd))) eccEnd++;
       if (conEnd <= conStart || eccEnd <= eccStart) {
         bad('duration');
         continue;
@@ -480,22 +589,49 @@ export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = 
       // a rep touches a filled (interpolated) sample => the data is partly invented
       const lossy = seg.filled.slice(Math.max(0, i0 - P), Math.max(0, i1 - P + 1)).some(Boolean);
 
-      reps.push({
-        index: reps.length + 1,
-        startedAtMs: tt[eccStart] * 1000,
-        eccentric,
-        concentric,
-        peakConcentricVelocity: concentric.peakVelocity,
-        meanConcentricVelocity: concentric.meanVelocity,
-        timeToPeakMs: (tt[conPeak] - tt[conStart]) * 1000,
-        totalDurationMs: (tt[conEnd] - tt[eccStart]) * 1000,
-        residualBias: bias,
-        lossy,
-      });
+      // Each phase must cover real travel by itself, not just the window.
+      if (concentric.rangeOfMotion < profile.phaseRomFrac * profile.romMinM || eccentric.rangeOfMotion < profile.phaseRomFrac * profile.romMinM) {
+        bad('rom');
+        continue;
+      }
 
-      for (let q = 0; q < m; q++) {
-        const oi = i0 + q - P;
-        if (oi >= 0 && oi < n) vTrace[oi] = v[q];
+      cands.push({
+        i0,
+        v,
+        m,
+        rep: {
+          index: 0, // assigned once the set-level check below has run
+          startedAtMs: tt[eccStart] * 1000,
+          eccentric,
+          concentric,
+          peakConcentricVelocity: concentric.peakVelocity,
+          meanConcentricVelocity: concentric.meanVelocity,
+          timeToPeakMs: (tt[conPeak] - tt[conStart]) * 1000,
+          totalDurationMs: (tt[conEnd] - tt[eccStart]) * 1000,
+          residualBias: bias,
+          lossy,
+        },
+      });
+    }
+
+    // Set-level consistency: the reps of one set are the same exercise, so
+    // one whose travel is a fraction of the rest is not a rep (typically the
+    // walkout / re-rack, integrated over a few noisy seconds).
+    let kept = cands;
+    if (cands.length >= 3) {
+      const typical = median(cands.map((c) => c.rep.concentric.rangeOfMotion));
+      kept = cands.filter((c) => {
+        if (c.rep.concentric.rangeOfMotion >= profile.setRomFrac * typical) return true;
+        rejected.push({ reason: 'rom', startedAtMs: c.rep.startedAtMs });
+        return false;
+      });
+    }
+    for (const c of kept) {
+      c.rep.index = reps.length + 1;
+      reps.push(c.rep);
+      for (let q = 0; q < c.m; q++) {
+        const oi = c.i0 + q - P;
+        if (oi >= 0 && oi < n) vTrace[oi] = c.v[q];
       }
     }
 
@@ -508,5 +644,5 @@ export function analyzeSet(samples: readonly RawSample[], profile: RepProfile = 
     for (let i = 0; i < n; i++) trace.v.push(vTrace[i]);
   }
 
-  return { reps, rejected, calibration, session: trace };
+  return { reps, rejected, calibration, session: trace, orientation };
 }

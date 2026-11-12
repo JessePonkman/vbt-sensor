@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { analyzeSet } from './reps.ts';
-import { SIM_SCENARIOS, simulateSquatSession, type SimOptions, type TruthRep } from './sim.ts';
+import { randomDataset, SIM_SCENARIOS, simulateSquatSession, type SimOptions, type TruthRep } from './sim.ts';
 import type { Rep } from './vbt.ts';
 
 /** A detected rep IS the real rep when their ascents overlap in time. Matching
@@ -97,4 +97,43 @@ test('a link stall longer than 0.25 s splits the recording instead of corrupting
 test('degenerate input does not throw', () => {
   assert.equal(analyzeSet([]).reps.length, 0);
   assert.equal(analyzeSet([{ timestamp: 0, ax: 0, ay: 0, az: 9.8, sequence: 0 }]).reps.length, 0);
+});
+
+// ---- regression guards on data the detector was never tuned against --------
+// Loose on purpose: they catch a real regression, they are not a target to
+// optimise. The full numbers are in BENCH.md (npm run bench:random / bench:final).
+
+test('guard: a random dataset (seeds 7000+) is found almost completely, with few phantoms', () => {
+  const { cases } = randomDataset(60, 7000);
+  let n = 0, found = 0, phantoms = 0;
+  for (const c of cases) {
+    const m = match(c.opts);
+    n += m.pairs.length;
+    found += m.pairs.filter((p) => p.rep).length;
+    phantoms += m.phantoms;
+  }
+  assert.ok(found / n >= 0.97, `found ${found}/${n}`);
+  assert.ok(phantoms <= 3, `${phantoms} phantom reps`);
+});
+
+test("guard: the project author's own squat generator (different physics) is found completely", async () => {
+  const { buildFriendSession, randomFriendParams } = await import('../scripts/friend-sim.ts');
+  let n = 0, found = 0, phantoms = 0;
+  for (let k = 0; k < 40; k++) {
+    const { samples, truth } = buildFriendSession(randomFriendParams(70000 + k));
+    const reps = analyzeSet(samples).reps;
+    const used = new Set<number>();
+    for (const t of truth) {
+      const idx = reps.findIndex((r, i) => {
+        if (used.has(i)) return false;
+        const end = (r.startedAtMs + r.totalDurationMs) / 1000;
+        return end > t.ascentStartS && end - r.concentric.durationMs / 1000 < t.endS;
+      });
+      if (idx >= 0) { used.add(idx); found++; }
+    }
+    n += truth.length;
+    phantoms += reps.length - used.size;
+  }
+  assert.ok(found / n >= 0.97, `found ${found}/${n}`);
+  assert.ok(phantoms <= 2, `${phantoms} phantom reps`);
 });

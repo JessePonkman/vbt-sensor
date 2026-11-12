@@ -40,6 +40,13 @@ export type SimOptions = {
   rerack: boolean; // walk forward + rerack after the set
   noiseSigma: number; // m/s^2
   bias: [number, number, number]; // m/s^2 per sensor axis
+  mountUp: [number, number, number]; // which way "up" points in the sensor frame: how it happens to be taped on the bar
+  emitGyro: boolean; // v2 packets carry the gyroscope; false makes v1-style accel-only samples
+  gyroNoise: number; // rad/s
+  gyroBias: [number, number, number]; // rad/s per sensor axis (a few deg/s is normal for a MEMS part)
+  pathSlant: number; // horizontal bar acceleration as a fraction of the vertical one (a squat bar path is not a plumb line)
+  tiltSwingDeg: number; // amplitude of the bar rolling on the lifter's back during the set
+  tiltSwingHz: number;
   scale: number; // accelerometer scale error (1.0 = perfect)
   dropoutRate: number; // fraction of packets lost over the air
   seed: number;
@@ -60,6 +67,13 @@ export const DEFAULT_SIM: SimOptions = {
   rerack: true,
   noiseSigma: 0.03,
   bias: [0.05, -0.08, 0.12],
+  mountUp: [0.31, -0.47, 0.83],
+  emitGyro: true,
+  gyroNoise: 0.01,
+  gyroBias: [0.02, -0.015, 0.01],
+  pathSlant: 0.35,
+  tiltSwingDeg: 0,
+  tiltSwingHz: 0.4,
   scale: 1.0,
   dropoutRate: 0,
   seed: 7,
@@ -314,10 +328,29 @@ export function simulateSquatSession(overrides: Partial<SimOptions> = {}): SimSe
 
   // Mounting: an arbitrary "up" direction in sensor space, via one
   // Gram-Schmidt step (same trick as vbt.test.ts).
-  const u = norm([0.31, -0.47, 0.83]);
+  const u = norm(o.mountUp);
   const seedV: [number, number, number] = Math.abs(u[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
   const e1 = norm(cross(u, seedV));
   const e2 = cross(u, e1);
+
+  // Bar tilt about the world Y axis: up to ~7 degrees while unracked
+  // (walkout/re-rack), plus an optional swing during the set (the bar rolling
+  // on the lifter's back — what makes a fixed "up" wrong in real recordings).
+  const setSpan = phases.find((p) => p.name === 'set')!;
+  const tiltAt = (t: number): number => {
+    let rad = 0;
+    for (const w of [walkout, rerack]) {
+      if (!w || t < w.start || t > w.end) continue;
+      const k = t - w.start;
+      const span = w.end - w.start;
+      rad = Math.max(rad, ((7 * Math.PI) / 180) * smoothstep(k / 1.2) * smoothstep((span - k) / 1.2));
+    }
+    if (o.tiltSwingDeg > 0 && t >= setSpan.startS - 0.5 && t <= setSpan.endS + 0.5) {
+      const env = smoothstep((t - (setSpan.startS - 0.5)) / 1.0) * smoothstep((setSpan.endS + 0.5 - t) / 1.0);
+      rad += ((o.tiltSwingDeg * Math.PI) / 180) * env * Math.sin(2 * Math.PI * o.tiltSwingHz * t);
+    }
+    return rad;
+  };
 
   const samples: RawSample[] = [];
   const n = Math.round(durationS * SIM_HZ);
@@ -326,11 +359,14 @@ export function simulateSquatSession(overrides: Partial<SimOptions> = {}): SimSe
 
     let aVert = 0;
     for (const s of segs) aVert += segAccel(s, ts);
+    // The bar moves forward as it descends and back as it rises: horizontal
+    // acceleration proportional to the rep's vertical one.
+    const aPath = o.pathSlant * aVert;
     for (const m of moves) aVert += moveAccel(m, ts);
 
-    let fx = 0; // horizontal specific force, world X
+    let fx = aPath; // horizontal specific force, world X
     let fy = 0;
-    let tiltRad = 0;
+    const tiltRad = tiltAt(ts);
 
     for (const w of [walkout, rerack]) {
       if (!w || ts < w.start || ts > w.end) continue;
@@ -342,8 +378,6 @@ export function simulateSquatSession(overrides: Partial<SimOptions> = {}): SimSe
       aVert += 0.9 * env * gait;
       fx += 1.1 * env * Math.sin(2 * Math.PI * 0.9 * k + 0.6);
       fy += 0.5 * env * Math.cos(2 * Math.PI * 0.9 * k);
-      // Torso tilt of the bar while unracked: up to ~7 degrees.
-      tiltRad = Math.max(tiltRad, ((7 * Math.PI) / 180) * env);
     }
     // Slight lateral sway during the set itself.
     fx += 0.25 * Math.sin(2 * Math.PI * 1.1 * ts);
@@ -362,10 +396,24 @@ export function simulateSquatSession(overrides: Partial<SimOptions> = {}): SimSe
     const ay = o.scale * by + o.bias[1] + gauss(r) * o.noiseSigma;
     const az = o.scale * bz + o.bias[2] + gauss(r) * o.noiseSigma;
 
+    // Gyroscope: the sensor rotates by -tilt about the (mounted) Y axis, so its
+    // body-frame rate is -d(tilt)/dt along e2, plus bias and noise.
+    const H = 1e-3;
+    const rate = -(tiltAt(ts + H) - tiltAt(ts - H)) / (2 * H);
+    const gx = rate * e2[0] + o.gyroBias[0] + gauss(r) * o.gyroNoise;
+    const gy = rate * e2[1] + o.gyroBias[1] + gauss(r) * o.gyroNoise;
+    const gz = rate * e2[2] + o.gyroBias[2] + gauss(r) * o.gyroNoise;
+
     // Dropouts: the packet is lost but the firmware's sequence kept counting.
     if (o.dropoutRate > 0 && r() < o.dropoutRate) continue;
 
-    samples.push({ timestamp: Math.round(ts * 1e6) % 2 ** 32, ax, ay, az, sequence: i });
+    const sample: RawSample = { timestamp: Math.round(ts * 1e6) % 2 ** 32, ax, ay, az, sequence: i };
+    if (o.emitGyro) {
+      sample.gx = gx;
+      sample.gy = gy;
+      sample.gz = gz;
+    }
+    samples.push(sample);
   }
 
   return { samples, truth: { reps: truthReps, phases, durationS } };
@@ -397,6 +445,10 @@ export const SIM_SCENARIOS: SimScenario[] = [
   { id: 'limite', label: 'Al límite', description: 'Subida de 4 s con punto de estancamiento', opts: { ...SQ, style: 'grind', tConS: 4.0, restBetweenRepsS: 1.5 } },
   { id: 'limite_extremo', label: 'Al límite (PR)', description: 'Subida de 6 s casi frenando, con pausa de 1 s', opts: { ...SQ, style: 'grind', tConS: 6.0, pauseS: 1.0, reps: 2, restBetweenRepsS: 2.0 } },
   { id: 'fatiga', label: 'Serie con fatiga', description: '6 reps, cada subida 25% más lenta que la anterior', opts: { ...SQ, reps: 6, tConS: 0.7, fatigue: 0.25 } },
+  { id: 'inclinada_suave', label: 'Barra rueda ±4°', description: 'Serie normal con la barra girando ±4° a 0,35 Hz sobre la espalda', opts: { ...SQ, tiltSwingDeg: 4, tiltSwingHz: 0.35 } },
+  { id: 'inclinada_fuerte', label: 'Barra rueda ±8°', description: 'Serie normal con la barra girando ±8° a 0,5 Hz', opts: { ...SQ, tiltSwingDeg: 8, tiltSwingHz: 0.5 } },
+  { id: 'rotacion_real', label: 'Rotación como capturas reales', description: 'Giro de ±15° a 0,4 Hz (~38 °/s pico), parecido a lo que miden las grabaciones reales', opts: { ...SQ, tiltSwingDeg: 15, tiltSwingHz: 0.4 } },
+  { id: 'walkout_inclinada', label: 'Walkout + barra rueda', description: 'Walkout, re-rack y la barra girando ±6° durante la serie', opts: { ...SQ, walkout: true, rerack: true, tiltSwingDeg: 6, tiltSwingHz: 0.4 } },
   { id: 'walkout', label: 'Walkout + re-rack', description: 'Serie normal con sacar y guardar la barra', opts: { ...SQ, walkout: true, rerack: true } },
   { id: 'walkout_lento', label: 'Walkout + tempo', description: 'Sacar y guardar la barra con una serie de tempo+pausa', opts: { ...SQ, walkout: true, rerack: true, tEccS: 3, pauseS: 2, tConS: 1.2, reps: 3 } },
 ];
@@ -408,4 +460,113 @@ function norm(v: [number, number, number]): [number, number, number] {
 
 function cross(a: [number, number, number], b: [number, number, number]): [number, number, number] {
   return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+// --- randomized dataset --------------------------------------------------------
+//
+// SIM_SCENARIOS above are hand-picked, and the detectors were tuned while
+// looking at them, so they cannot say how the code behaves on situations
+// nobody thought of. This draws EVERY parameter at random (style, tempo, pause,
+// depth, number of reps, fatigue, noise, bias, scale error, packet loss, how
+// the sensor is taped on, bar rolling, walkout...) from wide ranges, with its
+// own seeded generator, so a dataset of any size is reproducible and none of it
+// was seen while writing the detector.
+
+export type DatasetCase = { id: string; seed: number; opts: Partial<SimOptions>; tags: string[] };
+
+function drawOptions(seed: number): { opts: Partial<SimOptions>; tags: string[] } {
+  const r = rng(seed * 7919 + 13);
+  const uni = (lo: number, hi: number) => lo + (hi - lo) * r();
+  const pick = <T,>(items: readonly T[], weights: readonly number[]): T => {
+    let x = r() * weights.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < items.length; i++) {
+      x -= weights[i];
+      if (x <= 0) return items[i];
+    }
+    return items[items.length - 1];
+  };
+  const tags: string[] = [];
+
+  const style = pick<SimStyle>(['smooth', 'bounce', 'grind'], [0.55, 0.2, 0.25]);
+  tags.push(style);
+  const romM = uni(0.3, 0.7);
+  const reps = pick([1, 2, 3, 4, 5, 6, 8], [0.08, 0.12, 0.2, 0.2, 0.2, 0.12, 0.08]);
+
+  let tEccS = pick([uni(0.5, 1.2), uni(1.2, 2.5), uni(2.5, 5.0)], [0.25, 0.5, 0.25]);
+  let tConS = style === 'grind' ? uni(2.5, 7) : pick([uni(0.35, 0.7), uni(0.7, 1.5), uni(1.5, 3.5)], [0.3, 0.5, 0.2]);
+  let pauseS = style === 'bounce' ? 0 : pick([uni(0, 0.3), uni(0.3, 1.2), uni(1.2, 5)], [0.4, 0.35, 0.25]);
+  if (tEccS >= 3 || tConS >= 3) tags.push('lento');
+  tags.push(pauseS < 0.3 ? 'sin_pausa' : pauseS < 1.2 ? 'pausa_corta' : 'pausa_larga');
+  tEccS = Math.round(tEccS * 100) / 100;
+  tConS = Math.round(tConS * 100) / 100;
+  pauseS = Math.round(pauseS * 100) / 100;
+
+  const walkout = r() < 0.5;
+  const rerack = r() < 0.5;
+  if (walkout || rerack) tags.push('walkout');
+  const swing = r() < 0.5 ? 0 : uni(2, 18);
+  if (swing > 0) tags.push(swing > 9 ? 'rueda_fuerte' : 'rueda');
+  const dropoutRate = r() < 0.4 ? uni(0.005, 0.08) : 0;
+  if (dropoutRate > 0) tags.push('paquetes_perdidos');
+  const noiseSigma = uni(0.02, 0.15);
+  tags.push(noiseSigma <= 0.05 ? 'ruido_bajo' : noiseSigma <= 0.1 ? 'ruido_medio' : 'ruido_alto');
+  const emitGyro = r() < 0.85;
+  tags.push(emitGyro ? 'con_giro' : 'sin_giro');
+
+  // a random direction on the sphere for "up" in the sensor frame
+  const z = uni(-1, 1);
+  const phi = uni(0, 2 * Math.PI);
+  const rho = Math.sqrt(1 - z * z);
+
+  return {
+    tags,
+    opts: {
+      style,
+      reps,
+      romM,
+      tEccS,
+      tConS,
+      pauseS,
+      reversalS: uni(0.06, 0.35),
+      fatigue: r() < 0.4 ? uni(0, 0.3) : 0,
+      restBetweenRepsS: style === 'bounce' ? uni(0.3, 0.8) : uni(0.6, 3),
+      leadS: uni(1.5, 4),
+      walkout,
+      rerack,
+      noiseSigma,
+      bias: [uni(-0.3, 0.3), uni(-0.3, 0.3), uni(-0.3, 0.3)],
+      scale: uni(0.95, 1.05),
+      dropoutRate,
+      emitGyro,
+      gyroNoise: uni(0.005, 0.03),
+      gyroBias: [uni(-0.05, 0.05), uni(-0.05, 0.05), uni(-0.05, 0.05)],
+      pathSlant: uni(0, 0.6),
+      tiltSwingDeg: swing,
+      tiltSwingHz: uni(0.2, 0.8),
+      mountUp: [rho * Math.cos(phi), rho * Math.sin(phi), z],
+      seed: seed + 1,
+    },
+  };
+}
+
+/** `n` random, reproducible sessions. Draws that are not physically a squat a
+ *  MPU6050 could record (bar faster than 2.2 m/s, practically stalled, or
+ *  beyond the +-8 g rail) are skipped; `skipped` says how many. */
+export function randomDataset(n: number, seedBase = 1000): { cases: DatasetCase[]; skipped: number } {
+  const cases: DatasetCase[] = [];
+  let skipped = 0;
+  for (let seed = seedBase; cases.length < n; seed++) {
+    const { opts, tags } = drawOptions(seed);
+    const sim = simulateSquatSession(opts);
+    const rail = 8 * 9.81 * 0.95;
+    const ok =
+      sim.truth.reps.every((t) => t.peakConcentricVelocity <= 2.2 && t.meanConcentricVelocity >= 0.05 && t.romM > 0.2) &&
+      sim.samples.every((s) => Math.hypot(s.ax, s.ay, s.az) < rail);
+    if (!ok) {
+      skipped++;
+      continue;
+    }
+    cases.push({ id: `r${seed}`, seed, opts, tags });
+  }
+  return { cases, skipped };
 }

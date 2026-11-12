@@ -51,7 +51,33 @@ noise, an arbitrary mounting orientation, and a dropped-packet gap) through the 
 `vbt.ts` pipeline the app uses, and checks that recovered peak/mean velocity and ROM land within a
 few percent of the analytically known ground truth. Read it before touching `vbt.ts` §2's math.
 
-## The wire protocol (VBT Protocol v1)
+## How reps are detected, and how that is measured
+
+Reps are found by `src/reps.ts`, a batch detector over the recorded set: it reads
+the bar's *displacement* (double-integrated, high-passed), so a 6 s grinding PR, a
+4 s tempo descent and a long bottom pause are found like a fast rep. The streaming
+state machine in `src/vbt.ts` is still used for the live velocity trace, but it
+reads slow, uniform motion as "still" and misses those reps. With protocol v2 the
+gyroscope is fused (Mahony filter, `src/orientation.ts`, ported from
+`clients/desktop/imu.py` and checked against it on a real recording) to track the
+bar's tilt.
+
+```bash
+npm run bench           # 17 hand-picked scenarios + the real recordings, before/after
+npm run bench:random    # 600 randomized sessions
+npm run bench:final     # a fresh randomized dataset + the author's own generator
+```
+
+The results are in `BENCH.md`, including what they do **not** prove. In short: on
+simulated data the new detector finds ~99.5% of reps (the old one ~2%), and the
+peak velocity is within ~3%; mean velocity reads ~9-18% high because of how the
+start and end of the ascent are defined.
+
+## The wire protocol (VBT Protocol v1 and v2)
+
+The app parses both versions (dispatching on byte 1). v2 is 42 bytes: flags,
+txDropped, scheduled timestamp, sequence, jitter, accel, gyro, temperature; see
+`src/protocol.ts` for the layout. The description below is v1.
 
 22 bytes, little-endian, no padding. Source of truth: `../../firmware/src/main.cpp`.
 
@@ -71,9 +97,9 @@ BLE identifiers:
 - Service UUID: `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
 - Characteristic UUID: `beb5483e-36e1-4688-b7f5-ea07361b26a8` (READ + NOTIFY, no WRITE)
 
-⚠️ The default BLE MTU (23 bytes) only fits 20 payload bytes — too small for this 22-byte packet.
-The app requests MTU 247 on connect; if negotiation gives less than 25 bytes, it shows an error
-instead of silently parsing truncated data.
+⚠️ The default BLE MTU (23 bytes) only fits 20 payload bytes — too small for these packets.
+The app requests MTU 247 on connect; if negotiation gives less than 45 bytes (a 42-byte v2
+packet plus the ATT header), it shows an error instead of silently parsing truncated data.
 
 ## Screens
 

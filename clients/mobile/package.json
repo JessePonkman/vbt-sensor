@@ -26,7 +26,9 @@
     "web": "expo start --web",
     "test": "node --test src/*.test.ts",
     "lint": "expo lint",
-    "bench": "node scripts/bench.ts"
+    "bench": "node scripts/bench.ts",
+    "bench:random": "node scripts/bench-random.ts",
+    "bench:final": "node scripts/final-eval.ts"
   },
   "private": true
 }
