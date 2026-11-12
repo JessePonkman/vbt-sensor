@@ -39,6 +39,39 @@ function writeMeta(set: StoredSet): void {
   json.write(JSON.stringify(set));
 }
 
+export function getSet(id: string): StoredSet | null {
+  const f = jsonFile(id);
+  if (!f.exists) return null;
+  try {
+    return JSON.parse(f.textSync()) as StoredSet;
+  } catch {
+    return null;
+  }
+}
+
+// Small preferences (theme mode) in one JSON file next to the sets.
+const settingsFile = () => new File(Paths.document, 'settings.json');
+
+function readSettings(): Record<string, string> {
+  const f = settingsFile();
+  if (!f.exists) return {};
+  try {
+    return JSON.parse(f.textSync()) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+export function getSetting(key: string): string | null {
+  return readSettings()[key] ?? null;
+}
+
+export function setSetting(key: string, value: string): void {
+  const f = settingsFile();
+  f.create({ overwrite: true });
+  f.write(JSON.stringify({ ...readSettings(), [key]: value }));
+}
+
 /** Every saved set, newest first. A file that cannot be read is skipped, not fatal. */
 export function listSets(): StoredSet[] {
   const out: StoredSet[] = [];

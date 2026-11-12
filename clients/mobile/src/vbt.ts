@@ -48,6 +48,8 @@ export type Rep = {
   totalDurationMs: number;
   residualBias: number; // from detrend(); large |bias| => stale calibration or hardware issue
   lossy: boolean;
+  /** reps.ts only: the set's start/end mark cut this rep, so its numbers are not reliable. */
+  partial?: boolean;
 };
 
 export type RejectedRep = { reason: 'rom' | 'return' | 'duration' | 'gap'; startedAtMs: number };

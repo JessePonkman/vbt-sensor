@@ -103,3 +103,14 @@ test('a set with no load is stored as null, not 0 kg', () => {
   const sim = simulateSquatSession(SIM_SCENARIOS.find((s) => s.id === 'normal')!.opts);
   assert.equal(buildStoredSet(sim.samples, { source: 'sensor' }).loadKg, null);
 });
+
+test('a rep cut by the set marks is listed but kept out of the statistics', () => {
+  const cut = { ...fakeRep(0.9), partial: true }; // looks like the "best" rep, but it is a fragment
+  const s = summarizeSet([fakeRep(0.50), fakeRep(0.45), cut]);
+  assert.equal(s.reps, 2);
+  assert.equal(s.partialReps, 1);
+  assert.equal(s.rows.length, 3);
+  assert.ok(Math.abs(s.bestMeanV - 0.5) < 1e-12); // not 0.9
+  assert.ok(Math.abs(s.velocityLoss - 0.1) < 1e-9); // last COMPLETE rep is 0.45
+  assert.equal(s.rows[2].partial, true);
+});

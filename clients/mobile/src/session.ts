@@ -112,10 +112,13 @@ export type RepRow = {
   /** How far this rep's mean velocity fell below the set's best, 0..1. */
   dropFromBest: number;
   lossy: boolean; // packets were lost inside this rep
+  /** The set's start/end mark cut this rep: shown, but kept out of the set's statistics. */
+  partial: boolean;
 };
 
 export type SetSummary = {
-  reps: number;
+  reps: number; // complete reps (the ones every statistic below is computed from)
+  partialReps: number; // reps cut by the start/end mark, listed in `rows` but not counted above
   bestMeanV: number;
   lastMeanV: number;
   avgMeanV: number;
@@ -133,11 +136,14 @@ export type SetSummary = {
 
 const mean = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
 
-export function summarizeSet(reps: readonly Rep[]): SetSummary {
+export function summarizeSet(allReps: readonly Rep[]): SetSummary {
+  // A rep cut by the lifter's start/end mark is listed, but its velocity is not
+  // trustworthy, so it cannot be "the best rep" or "the last rep" of the set.
+  const reps = allReps.filter((r) => !r.partial);
   const best = reps.reduce((m, r) => Math.max(m, r.concentric.meanVelocity), 0);
   const worst = reps.length ? reps.reduce((m, r) => Math.min(m, r.concentric.meanVelocity), Infinity) : 0;
   const last = reps.length ? reps[reps.length - 1].concentric.meanVelocity : 0;
-  const rows: RepRow[] = reps.map((r, i) => ({
+  const rowOf = (r: Rep, i: number): RepRow => ({
     index: i + 1,
     meanV: r.concentric.meanVelocity,
     peakV: r.concentric.peakVelocity,
@@ -145,21 +151,25 @@ export function summarizeSet(reps: readonly Rep[]): SetSummary {
     romM: r.concentric.rangeOfMotion,
     conS: r.concentric.durationMs / 1000,
     eccS: r.eccentric.durationMs / 1000,
-    dropFromBest: best > 0 ? Math.max(0, (best - r.concentric.meanVelocity) / best) : 0,
+    dropFromBest: !r.partial && best > 0 ? Math.max(0, (best - r.concentric.meanVelocity) / best) : 0,
     lossy: r.lossy,
-  }));
+    partial: !!r.partial,
+  });
+  const rows = allReps.map(rowOf);
+  const full = rows.filter((r) => !r.partial);
   return {
     reps: reps.length,
+    partialReps: allReps.length - reps.length,
     bestMeanV: best,
     lastMeanV: last,
-    avgMeanV: mean(rows.map((r) => r.meanV)),
+    avgMeanV: mean(full.map((r) => r.meanV)),
     bestPeakV: reps.reduce((m, r) => Math.max(m, r.concentric.peakVelocity), 0),
-    avgPeakV: mean(rows.map((r) => r.peakV)),
+    avgPeakV: mean(full.map((r) => r.peakV)),
     velocityLoss: best > 0 ? (best - last) / best : 0,
     maxVelocityLoss: best > 0 ? (best - worst) / best : 0,
-    avgRomM: mean(rows.map((r) => r.romM)),
-    avgConS: mean(rows.map((r) => r.conS)),
-    avgEccS: mean(rows.map((r) => r.eccS)),
+    avgRomM: mean(full.map((r) => r.romM)),
+    avgConS: mean(full.map((r) => r.conS)),
+    avgEccS: mean(full.map((r) => r.eccS)),
     rows,
   };
 }

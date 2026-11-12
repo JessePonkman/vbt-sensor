@@ -71,6 +71,10 @@ export const SQUAT_PROFILE: RepProfile = {
   moveCeil: 0.04,
 };
 
+/** Fitted start velocity / bias beyond which an edge rep counts as cut by the set's marks. */
+const PARTIAL_V_START = 0.15; // m/s
+const PARTIAL_BIAS = 0.08; // m/s^2
+
 /** Seconds of assumed stillness added before and after every recorded segment. */
 const EDGE_REST_S = 3;
 
@@ -470,9 +474,14 @@ export function analyzeSet(
     const ext = zigzag(sHp, 0.06);
     const eps = Math.max(0.05, 5 * noiseFloor(aLp));
     const sigmaA = noiseFloor(aVert); // raw accelerometer noise on the vertical axis, m/s^2
+
     const vTrace = new Array<number>(n).fill(0); // corrected velocity inside accepted reps, 0 elsewhere
     let prevEnd = -1; // padded index where the previous accepted rep's concentric ended
     const cands: { rep: Rep; i0: number; v: number[]; m: number }[] = [];
+
+    // Candidate reps in order, so the edge ones can be told apart.
+    const lastMin = ext.reduce((acc, e, q) => (e.kind === 'min' && q + 1 < ext.length ? q : acc), -1);
+    const firstMin = ext.findIndex((e, q) => e.kind === 'min' && q >= 1 && q + 1 < ext.length);
 
     for (let k = 1; k + 1 < ext.length; k++) {
       if (ext[k].kind !== 'min' || ext[k - 1].kind !== 'max' || ext[k + 1].kind !== 'max') continue;
@@ -505,6 +514,15 @@ export function analyzeSet(
         bad('return');
         continue;
       }
+      // The set is delimited by the lifter's own Start / End marks. A mark
+      // pressed while the bar was already moving cuts the rep at that edge, and
+      // the fit above then needs an implausible starting velocity (first rep)
+      // or an implausible bias (last rep) to make the books balance. Flag it
+      // rather than drop it: the rep did happen, but its numbers (above all the
+      // mean velocity) are not trustworthy and must not drive the set's stats.
+      const partial =
+        (k === firstMin && Math.abs(vStart) > PARTIAL_V_START) ||
+        (k === lastMin && (Math.abs(bias) > PARTIAL_BIAS || Math.abs(vStart) > PARTIAL_V_START));
       const v = vInt.map((x, q) => x + vStart + bias * (tt[q] - tt[0]));
       const s = cumtrapz(v, dt);
 
@@ -610,6 +628,7 @@ export function analyzeSet(
           totalDurationMs: (tt[conEnd] - tt[eccStart]) * 1000,
           residualBias: bias,
           lossy,
+          ...(partial ? { partial: true } : {}),
         },
       });
     }

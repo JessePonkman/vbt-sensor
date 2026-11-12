@@ -36,6 +36,7 @@ export type SimOptions = {
   fatigue: number; // each rep's ascent is this fraction slower than the last
   restBetweenRepsS: number; // standing still between reps
   leadS: number; // stillness before anything happens (calibration window)
+  trailS: number; // stillness after the last movement
   walkout: boolean; // unrack + walk back before the set
   rerack: boolean; // walk forward + rerack after the set
   noiseSigma: number; // m/s^2
@@ -63,6 +64,7 @@ export const DEFAULT_SIM: SimOptions = {
   fatigue: 0,
   restBetweenRepsS: 1.2,
   leadS: 2.0,
+  trailS: 2.0,
   walkout: true,
   rerack: true,
   noiseSigma: 0.03,
@@ -289,7 +291,7 @@ export function simulateSquatSession(overrides: Partial<SimOptions> = {}): SimSe
     phases.push({ name: 'rerack', startS: rerack.start, endS: rerack.end });
     t = rerack.end;
   }
-  const durationS = t + 2.0;
+  const durationS = t + o.trailS;
 
   // Ground truth, from the exact velocity path sampled at 1 kHz.
   const truthReps: TruthRep[] = repSpans.map((span, i) => {

@@ -103,19 +103,43 @@ packet plus the ATT header), it shows an error instead of silently parsing trunc
 
 ## Screens
 
-Four tabs (Expo Router, routes under `src/app/`):
+The app is for **reviewing a set afterwards**, not for live feedback. Three tabs (Expo
+Router, routes under `src/app/`), plus the set detail:
 
-- **Live** — scan/connect when disconnected; once connected, calibration status, Start/End set,
-  and live acceleration + velocity charts (last 3 s, approximate).
-- **Serie** — the last completed set: full acceleration + velocity charts and the per-rep table
-  (eccentric/concentric peak and mean velocity).
-- **Velas** — one candle per rep of the last set, eccentric and concentric, showing min/max/mean
-  velocity per phase.
-- **Raw** — the original debug view: the raw sample log with the hex toggle.
+- **Grabar** — connect the sensor (or try the built-in simulator, "modo demo"), optionally type
+  the load in kg, tap **Marcar inicio** with the bar still, do the set, tap **Marcar fin** with
+  the bar up and still. Nothing starts or stops by itself, so the analysis gets exactly the
+  window the lifter meant. While recording only a timer and "data arriving" are shown.
+- **Detalle de la serie** (`set/[id]`, opened right after *Marcar fin* and from the history) —
+  headline numbers (reps, best mean velocity, velocity loss, range of motion, times), one bar per
+  rep coloured by how far it fell below the best rep, the whole velocity curve with each rep
+  shaded and numbered, and the rep table. Tapping a rep in a chart or the table highlights it in
+  all three. Edit the load and a note, share the raw CSV, re-analyze or delete the set.
+- **Historial** — every set saved on the phone, newest first.
+- **Ajustes** — appearance (automatic / light for sun / dark) and the raw packet view.
 
-Calibration is automatic: hold the bar still for about a second and the app resolves gravity from
-whatever angle the sensor happens to be taped on at. There's no calibration button — the "Iniciar
-serie" button just waits for `calibrated` to go true.
+Each recorded set is saved on the phone as `<id>.csv` (raw samples, **the same 13-column format
+as `clients/desktop`**, so it opens in the desktop tool and desktop recordings import) and
+`<id>.json` (metadata + analysis). See `src/session.ts` and `src/store.ts`.
+
+### Trying it in a browser
+
+The same app runs in a browser, with the simulator standing in for the sensor and
+`localStorage` standing in for the file system (`src/ble.web.ts`, `src/store.web.ts`):
+
+```bash
+npx expo start --web
+```
+
+It is the quickest way to look at the screens at any window size. "Cargar series de ejemplo" in
+the history fills it with simulated sets. It does not replace testing on a phone: Bluetooth,
+the file system and sharing only exist there.
+
+### Layout
+
+One column up to ~760 dp, centred; from 900 dp the detail splits into charts on the left and
+numbers on the right (`src/responsive.ts`). Controls are at least 52 dp tall. Light theme is
+pure white with near-black text for direct sun.
 
 ## Hardware validation checklist
 

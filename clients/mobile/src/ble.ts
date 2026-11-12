@@ -3,10 +3,16 @@
 // already one-liners on `manager` — no point wrapping those too.
 
 import { Linking, PermissionsAndroid, Platform } from 'react-native';
-import { BleError, BleManager, Device, Subscription } from 'react-native-ble-plx';
+import { BleError, BleManager, Device, State, Subscription } from 'react-native-ble-plx';
 import { CHARACTERISTIC_UUID, MIN_PACKET_MTU, SERVICE_UUID } from './protocol';
 
 export const manager = new BleManager();
+
+/** Re-exported so screens and the provider never import the native package
+ *  directly: ble.web.ts provides the same names for the browser preview. */
+export const AdapterState = State;
+export type AdapterStateValue = State;
+export type BleDevice = Device;
 
 // Largest packet (v2, 42 bytes) + 3-byte ATT header. Below this, notifications get truncated.
 const MIN_USABLE_MTU = MIN_PACKET_MTU;

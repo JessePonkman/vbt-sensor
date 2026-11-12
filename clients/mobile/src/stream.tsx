@@ -1,22 +1,23 @@
-// Everything app-wide: the BLE connection state machine (was App.tsx's local
-// state), the sample buffer + 100ms ticker (was useVbtStream.ts), and set
-// recording, wired through the vbt.ts processor. Two contexts instead of one
-// so the 100ms tick doesn't re-render Set/Candles, which only read a frozen
-// snapshot published once at End set — see PLAN-V2.md §3.3.
+// Everything app-wide that is not a screen: the sensor connection (BLE, or the
+// built-in simulator in demo mode), the live packet statistics, and recording a
+// set between the lifter's own Start and End marks.
 //
-// The old `key={sessionId}` remount-to-reset trick doesn't survive the
-// provider sitting above the router (remounting it would remount every
-// screen), so reset() is explicit instead — see PLAN-V2.md §3.4.
+// What this deliberately does NOT do any more: live velocity or live rep
+// counting. The app is for reviewing a set afterwards, so while recording the
+// only live feedback is "data is arriving" (packet count, rate, losses). The
+// set is analyzed once, when End is pressed (reps.ts), saved to the phone
+// (store.ts) and opened in the detail screen.
+//
+// Two contexts, so the 10 Hz statistics tick does not re-render screens that
+// only care about the connection.
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { Device, State as AdapterState } from 'react-native-ble-plx';
-import { connectAndPrepare, manager, monitorSamples, requestBlePermissions } from './ble';
+import { AdapterState, connectAndPrepare, manager, monitorSamples, requestBlePermissions, type AdapterStateValue, type BleDevice } from './ble';
 import { parsePacket, SERVICE_UUID, type VbtSample } from './protocol';
-import { SIM_HZ, simulateSquatSession } from './sim';
-import { analyzeSet } from './reps';
 import { buildStoredSet } from './session';
+import { SIM_HZ, SIM_SCENARIOS, simulateSquatSession } from './sim';
 import { saveSet } from './store';
-import { createVbtProcessor, type LiveState, type RawSample, type Rep, type RejectedRep } from './vbt';
+import type { RawSample } from './vbt';
 
 export type LogRow =
   | { key: string; kind: 'sample'; sample: VbtSample }
@@ -24,53 +25,45 @@ export type LogRow =
 
 export type StreamStats = { packets: number; malformed: number; lost: number; rateHz: number };
 
-export type SetData = {
-  id: number;
-  startedAt: number; // Date.now() when Start set was pressed
-  durationMs: number;
-  reps: Rep[];
-  rejected: RejectedRep[];
-  meanVelocity: number; // mean of per-rep concentric means
-  meanAccel: number; // mean concentric acceleration (peak v / time-to-peak) across reps
-  t: number[];
-  ax: number[];
-  ay: number[];
-  az: number[];
-  v: number[]; // corrected velocity, exactly reproducing the rep table (PLAN-V2.md §4.3)
-};
-
 type AppState = 'idle' | 'scanning' | 'connecting' | 'connected';
 const SCAN_TIMEOUT_MS = 10_000;
 const LOG_SIZE = 200;
 const TICK_MS = 100;
 const RATE_WINDOW_MS = 1000;
-const LIVE_WINDOW_S = 3;
-const REP_COUNT_EVERY_MS = 2000;
+
+/** The scenarios the demo can replay (the simulator's, minus the walkout ones:
+ *  the lifter marks Start after the walkout, as they would in the gym). */
+export const DEMO_SCENARIOS = SIM_SCENARIOS.filter((s) => ['normal', 'rapida', 'pausa_larga', 'tempo_pausa', 'rebote_brusco', 'limite', 'fatiga'].includes(s.id));
+
+export type EndResult = { ok: true; id: string } | { ok: false; error: string };
 
 // --- ConnCtx: changes only on user action / BLE event ----------------------
 
 type ConnState = {
   appState: AppState;
-  adapterState: AdapterState;
+  adapterState: AdapterStateValue;
   permissionDenied: boolean;
   notice: string | null;
-  devices: Device[];
-  device: Device | null;
+  devices: BleDevice[];
+  device: BleDevice | null;
   rssi: number | null;
-  sets: SetData[];
+  demo: boolean;
+  demoScenario: string;
   isRecording: boolean;
-  demo: boolean; // true while replaying the built-in simulator instead of a BLE sensor
 };
 
 type ConnActions = {
   scan: () => void;
-  select: (device: Device) => void;
+  select: (device: BleDevice) => void;
   disconnect: () => void;
-  startSet: () => void;
-  endSet: () => void;
-  recalibrate: () => void;
-  startDemo: () => void;
+  startDemo: (scenarioId?: string) => void;
   stopDemo: () => void;
+  /** Mark the start of a set: from now on samples belong to it. */
+  startSet: () => void;
+  /** Mark the end: analyze, save and return the saved set's id. */
+  endSet: (meta: { loadKg: number | null; note?: string }) => EndResult;
+  /** Throw away the set being recorded. */
+  cancelSet: () => void;
 };
 
 const ConnCtx = createContext<(ConnState & ConnActions) | null>(null);
@@ -81,35 +74,10 @@ export function useConn() {
   return ctx;
 }
 
-// --- LiveCtx: republished every 100ms ---------------------------------------
+// --- LiveCtx: republished every 100 ms ---------------------------------------
 
-type LiveWindow = { t: number[]; ax: number[]; ay: number[]; az: number[]; a: number[]; v: number[] };
-
-type LiveTick = {
-  rows: LogRow[];
-  stats: StreamStats;
-  paused: boolean;
-  live: LiveState;
-  win: LiveWindow;
-  repCount: number;
-  setElapsedMs: number;
-  streamError: string | null;
-};
-
-const EMPTY_STATS: StreamStats = { packets: 0, malformed: 0, lost: 0, rateHz: 0 };
-const EMPTY_LIVE: LiveState = { calibrated: false, still: false, state: 'idle', aVert: 0, vVert: 0 };
-const EMPTY_WIN: LiveWindow = { t: [], ax: [], ay: [], az: [], a: [], v: [] };
-const EMPTY_TICK: LiveTick = {
-  rows: [],
-  stats: EMPTY_STATS,
-  paused: false,
-  live: EMPTY_LIVE,
-  win: EMPTY_WIN,
-  repCount: 0,
-  setElapsedMs: 0,
-  streamError: null,
-};
-
+type LiveTick = { rows: LogRow[]; stats: StreamStats; paused: boolean; setElapsedMs: number; setSamples: number };
+const EMPTY_TICK: LiveTick = { rows: [], stats: { packets: 0, malformed: 0, lost: 0, rateHz: 0 }, paused: false, setElapsedMs: 0, setSamples: 0 };
 const LiveCtx = createContext<LiveTick & { togglePause: () => void }>({ ...EMPTY_TICK, togglePause: () => {} });
 
 export function useLive() {
@@ -118,7 +86,7 @@ export function useLive() {
 
 // --- buffer -----------------------------------------------------------------
 
-type Recording = { id: number; startedAt: number; samples: RawSample[]; repCount: number };
+type Recording = { startedAt: number; samples: RawSample[] };
 
 function freshBuffer() {
   return {
@@ -128,24 +96,21 @@ function freshBuffer() {
     malformed: 0,
     lost: 0,
     rxTimes: [] as number[],
-    win: { t: [] as number[], ax: [] as number[], ay: [] as number[], az: [] as number[], a: [] as number[], v: [] as number[] },
-    proc: createVbtProcessor(),
     rec: null as Recording | null,
-    nextSetId: 1,
   };
 }
 
 export function VbtProvider({ children }: { children: React.ReactNode }) {
-  const [adapterState, setAdapterState] = useState<AdapterState>(AdapterState.Unknown);
+  const [adapterState, setAdapterState] = useState<AdapterStateValue>(AdapterState.Unknown);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [appState, setAppState] = useState<AppState>('idle');
-  const [scannedDevices, setScannedDevices] = useState<Map<string, Device>>(new Map());
-  const [device, setDevice] = useState<Device | null>(null);
+  const [scanned, setScanned] = useState<Map<string, BleDevice>>(new Map());
+  const [device, setDevice] = useState<BleDevice | null>(null);
   const [rssi, setRssi] = useState<number | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [sets, setSets] = useState<SetData[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [demo, setDemo] = useState(false);
+  const [demoScenario, setDemoScenario] = useState('normal');
 
   const [tick, setTick] = useState<LiveTick>(EMPTY_TICK);
   const [paused, setPaused] = useState(false);
@@ -153,14 +118,10 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   const buf = useRef(freshBuffer());
   const scanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalDisconnectRef = useRef(false);
-  const deviceRef = useRef<Device | null>(null);
+  const deviceRef = useRef<BleDevice | null>(null);
   const pausedRef = useRef(false);
-  const lastCountAt = useRef(0);
   const demoRef = useRef(false);
 
-  // Refs are only for the unmount-cleanup and 100ms-ticker effects below to
-  // read the latest value without depending on it — never mutate a ref
-  // during render itself.
   useEffect(() => {
     deviceRef.current = device;
   }, [device]);
@@ -176,13 +137,11 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     setTick(EMPTY_TICK);
   }, []);
 
-  // Adapter power state — scanning/connecting only make sense while PoweredOn.
   useEffect(() => {
     const subscription = manager.onStateChange(setAdapterState, true);
     return () => subscription.remove();
   }, []);
 
-  // Unmount cleanup only, via refs so it doesn't need to re-run per connection.
   useEffect(() => {
     return () => {
       if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
@@ -194,23 +153,20 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   const scan = useCallback(async () => {
     setNotice(null);
     if (adapterState !== AdapterState.PoweredOn) return;
-
     const granted = await requestBlePermissions();
     setPermissionDenied(!granted);
     if (!granted) return;
 
-    setScannedDevices(new Map());
+    setScanned(new Map());
     setAppState('scanning');
-
     manager.startDeviceScan([SERVICE_UUID], null, (error, found) => {
       if (error) {
         setNotice(error.message);
         setAppState('idle');
         return;
       }
-      if (found) setScannedDevices((prev) => new Map(prev).set(found.id, found));
+      if (found) setScanned((prev) => new Map(prev).set(found.id, found));
     });
-
     if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
     scanTimeoutRef.current = setTimeout(() => {
       manager.stopDeviceScan();
@@ -219,30 +175,29 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
   }, [adapterState]);
 
   const select = useCallback(
-    (picked: Device) => {
+    (picked: BleDevice) => {
       if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
       manager.stopDeviceScan();
       setNotice(null);
       setAppState('connecting');
-
       connectAndPrepare(picked.id).then(
         (prepared) => {
           intentionalDisconnectRef.current = false;
           reset();
           setRssi(picked.rssi);
           setDevice(prepared);
-          setSets([]);
           setIsRecording(false);
           setAppState('connected');
-
           prepared.onDisconnected(() => {
             setDevice(null);
+            setIsRecording(false);
+            buf.current.rec = null;
             setAppState('idle');
-            if (!intentionalDisconnectRef.current) setNotice('Device disconnected');
+            if (!intentionalDisconnectRef.current) setNotice('El sensor se desconectó.');
           });
         },
         (error) => {
-          setNotice(error instanceof Error ? error.message : 'Connection failed');
+          setNotice(error instanceof Error ? error.message : 'No se pudo conectar');
           setAppState('idle');
         }
       );
@@ -250,18 +205,22 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
     [reset]
   );
 
-  const startDemo = useCallback(() => {
-    setNotice(null);
-    reset();
-    setSets([]);
-    setIsRecording(false);
-    setDemo(true);
-    setAppState('connected');
-  }, [reset]);
+  const startDemo = useCallback(
+    (scenarioId = 'normal') => {
+      setNotice(null);
+      reset();
+      setDemoScenario(scenarioId);
+      setIsRecording(false);
+      setDemo(true);
+      setAppState('connected');
+    },
+    [reset]
+  );
 
   const stopDemo = useCallback(() => {
     setDemo(false);
     setIsRecording(false);
+    buf.current.rec = null;
     setAppState('idle');
     setNotice(null);
   }, []);
@@ -278,61 +237,35 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
 
   const startSet = useCallback(() => {
     if (buf.current.rec) return;
-    buf.current.rec = { id: buf.current.nextSetId++, startedAt: Date.now(), samples: [], repCount: 0 };
+    buf.current.rec = { startedAt: Date.now(), samples: [] };
     setIsRecording(true);
   }, []);
 
-  const endSet = useCallback(() => {
+  const cancelSet = useCallback(() => {
+    buf.current.rec = null;
+    setIsRecording(false);
+  }, []);
+
+  const endSet = useCallback((meta: { loadKg: number | null; note?: string }): EndResult => {
     const rec = buf.current.rec;
     buf.current.rec = null;
     setIsRecording(false);
-    if (!rec || rec.samples.length === 0) return;
-
-    // Re-analyze the full recorded sample array in one batch pass, fresh —
-    // this is what makes the table and the velocity chart exactly agree
-    // (PLAN-V2.md §4.3), rather than reconciling the live estimate. The
-    // displacement-based detector (reps.ts) is used here: the streaming FSM in
-    // vbt.ts reads slow reps as "still" and misses them (see scripts/bench.ts).
-    const { reps, rejected, session } = analyzeSet(rec.samples);
-
-    // Every recorded set is kept on the phone (raw CSV + analysis), so it can be
-    // reviewed later, compared, exported or re-analyzed. A failure to write must
-    // never lose the set on screen, so it only raises a notice.
-    try {
-      saveSet(buildStoredSet(rec.samples, { source: demoRef.current ? 'demo' : 'sensor', createdAt: rec.startedAt }), rec.samples);
-    } catch (e) {
-      setNotice(`No se pudo guardar la serie: ${e instanceof Error ? e.message : String(e)}`);
+    if (!rec || rec.samples.length < SIM_HZ * 2) {
+      return { ok: false, error: 'La serie es muy corta (menos de 2 s). Marcá el inicio, hacé la serie y marcá el fin.' };
     }
-    const conMeans = reps.map((r) => r.meanConcentricVelocity);
-    const conAccels = reps.map((r) => r.peakConcentricVelocity / Math.max(0.001, r.timeToPeakMs / 1000));
-
-    setSets((prev) => [
-      ...prev,
-      {
-        id: rec.id,
-        startedAt: rec.startedAt,
-        durationMs: session.t.length > 0 ? (session.t[session.t.length - 1] - session.t[0]) * 1000 : 0,
-        reps,
-        rejected,
-        meanVelocity: conMeans.length > 0 ? conMeans.reduce((a, b) => a + b, 0) / conMeans.length : 0,
-        meanAccel: conAccels.length > 0 ? conAccels.reduce((a, b) => a + b, 0) / conAccels.length : 0,
-        t: session.t,
-        ax: session.ax,
-        ay: session.ay,
-        az: session.az,
-        v: session.v,
-      },
-    ]);
-  }, []);
-
-  const recalibrate = useCallback(() => {
-    buf.current.proc.reset();
+    try {
+      // Every recorded set is kept on the phone (raw CSV + analysis) so it can be
+      // reviewed later, compared, exported or re-analyzed.
+      const set = buildStoredSet(rec.samples, { source: demoRef.current ? 'demo' : 'sensor', createdAt: rec.startedAt, loadKg: meta.loadKg, note: meta.note });
+      saveSet(set, rec.samples);
+      return { ok: true, id: set.id };
+    } catch (e) {
+      return { ok: false, error: `No se pudo guardar la serie: ${e instanceof Error ? e.message : String(e)}` };
+    }
   }, []);
 
   // The single entry point for a decoded packet, whatever produced it (BLE
-  // notification or the demo simulator). Everything downstream — the loss
-  // counter, the live window, the VBT processor, set recording — is shared,
-  // so demo mode exercises exactly the code a real sensor would.
+  // notification or the demo simulator).
   const ingest = useCallback((sample: VbtSample) => {
     const last = buf.current.lastSeq;
     if (last !== null && sample.sequence > last + 1) {
@@ -340,45 +273,17 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
       buf.current.lost += gap;
       buf.current.rows.push({ key: `gap-${last}`, kind: 'gap', afterSequence: last, count: gap });
     }
-    // sample.sequence <= last means the ESP32 rebooted (its counter
-    // restarts at 0) — just resync below instead of counting loss.
+    // sequence <= last means the ESP32 rebooted (its counter restarts at 0)
     buf.current.lastSeq = sample.sequence;
-
     buf.current.packets += 1;
     buf.current.rxTimes.push(sample.rxAt);
-
     buf.current.rows.push({ key: String(sample.sequence), kind: 'sample', sample });
     if (buf.current.rows.length > LOG_SIZE) buf.current.rows.splice(0, buf.current.rows.length - LOG_SIZE);
-
-    buf.current.proc.push(sample);
-    const live = buf.current.proc.live;
-    buf.current.proc.takeReps(); // drain the streaming FSM's reps; the set's real numbers come from analyzeSet
     if (buf.current.rec) buf.current.rec.samples.push(sample);
-
-    const win = buf.current.win;
-    win.t.push(sample.rxAt / 1000);
-    win.ax.push(sample.ax);
-    win.ay.push(sample.ay);
-    win.az.push(sample.az);
-    win.a.push(live.aVert);
-    win.v.push(live.vVert);
-    const cutoff = sample.rxAt / 1000 - LIVE_WINDOW_S;
-    let cut = 0;
-    while (cut < win.t.length && win.t[cut] < cutoff) cut++;
-    if (cut > 0) {
-      win.t.splice(0, cut);
-      win.ax.splice(0, cut);
-      win.ay.splice(0, cut);
-      win.az.splice(0, cut);
-      win.a.splice(0, cut);
-      win.v.splice(0, cut);
-    }
   }, []);
 
-  // Subscribe to the connected device's notifications.
   useEffect(() => {
     if (!device) return;
-
     const subscription = monitorSamples(
       device,
       (bytes) => {
@@ -391,107 +296,58 @@ export function VbtProvider({ children }: { children: React.ReactNode }) {
       },
       (error) => setNotice(error.message)
     );
-
     return () => subscription.remove();
   }, [device, ingest]);
 
-  // Demo mode: replay a simulated session (walkout -> set -> re-rack) at real
-  // time, 100 Hz, through the same ingest() path as real BLE packets.
+  // Demo mode: replay a simulated session at real time, 100 Hz, through the
+  // same ingest() path as real BLE packets. It is long enough to mark Start
+  // after a few seconds of stillness and End after the last rep.
   useEffect(() => {
     if (!demo) return;
-
-    const { samples } = simulateSquatSession();
+    const sc = DEMO_SCENARIOS.find((x) => x.id === demoScenario) ?? DEMO_SCENARIOS[0];
+    const { samples } = simulateSquatSession({ ...sc.opts, walkout: false, rerack: false, leadS: 8, trailS: 25, seed: Math.floor(Math.random() * 1e6) });
     const startedAt = Date.now();
     let next = 0;
-
     const interval = setInterval(() => {
-      const now = Date.now();
-      const due = Math.floor(((now - startedAt) / 1000) * SIM_HZ);
+      const due = Math.floor(((Date.now() - startedAt) / 1000) * SIM_HZ);
       while (next < samples.length && samples[next].sequence <= due) {
         const s = samples[next++];
-        // rxAt is stamped at "arrival": derive it from the sample's own slot so
-        // a late timer tick doesn't bunch packets up and distort the Hz readout.
         ingest({ ...s, version: 2, rxAt: startedAt + s.sequence * (1000 / SIM_HZ), raw: new Uint8Array(0) });
       }
       if (next >= samples.length) {
         clearInterval(interval);
-        setNotice('Demo terminada');
+        setNotice('La demo terminó. Volvé a iniciarla para otra.');
       }
     }, 20);
-
     return () => clearInterval(interval);
-  }, [demo, ingest]);
+  }, [demo, demoScenario, ingest]);
 
-  // Publish buffer -> state at 10fps, independent of the incoming packet rate.
+  // Publish the buffer -> state at 10 fps, independent of the packet rate.
   useEffect(() => {
     if (!device && !demo) return;
-
     const interval = setInterval(() => {
       const cutoff = Date.now() - RATE_WINDOW_MS;
       buf.current.rxTimes = buf.current.rxTimes.filter((t) => t >= cutoff);
       const rateHz = buf.current.rxTimes.length / (RATE_WINDOW_MS / 1000);
-      const live = buf.current.proc.live;
       const rec = buf.current.rec;
-
-      // Live rep counter: re-run the batch detector over the set so far every
-      // 2 s (~3 ms for a typical set on a laptop). A rep counts once it is
-      // complete, so the number lags the lifter by about a rep's tail.
-      if (rec && Date.now() - lastCountAt.current >= REP_COUNT_EVERY_MS) {
-        lastCountAt.current = Date.now();
-        rec.repCount = analyzeSet(rec.samples).reps.length;
-      }
-
       setTick((prev) => ({
         rows: pausedRef.current ? prev.rows : [...buf.current.rows].reverse(),
         stats: { packets: buf.current.packets, malformed: buf.current.malformed, lost: buf.current.lost, rateHz },
         paused: pausedRef.current,
-        live,
-        win: {
-          t: [...buf.current.win.t],
-          ax: [...buf.current.win.ax],
-          ay: [...buf.current.win.ay],
-          az: [...buf.current.win.az],
-          a: [...buf.current.win.a],
-          v: [...buf.current.win.v],
-        },
-        repCount: rec ? rec.repCount : 0,
         setElapsedMs: rec ? Date.now() - rec.startedAt : 0,
-        streamError: null,
+        setSamples: rec ? rec.samples.length : 0,
       }));
     }, TICK_MS);
-
     return () => clearInterval(interval);
   }, [device, demo]);
 
   const togglePause = useCallback(() => setPaused((p) => !p), []);
 
-  const devices = useMemo(
-    () => Array.from(scannedDevices.values()).sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999)),
-    [scannedDevices]
-  );
+  const devices = useMemo(() => Array.from(scanned.values()).sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999)), [scanned]);
 
   const connValue = useMemo<ConnState & ConnActions>(
-    () => ({
-      appState,
-      adapterState,
-      permissionDenied,
-      notice,
-      devices,
-      device,
-      rssi,
-      sets,
-      isRecording,
-      demo,
-      scan,
-      select,
-      disconnect,
-      startSet,
-      endSet,
-      recalibrate,
-      startDemo,
-      stopDemo,
-    }),
-    [appState, adapterState, permissionDenied, notice, devices, device, rssi, sets, isRecording, demo, scan, select, disconnect, startSet, endSet, recalibrate, startDemo, stopDemo]
+    () => ({ appState, adapterState, permissionDenied, notice, devices, device, rssi, demo, demoScenario, isRecording, scan, select, disconnect, startDemo, stopDemo, startSet, endSet, cancelSet }),
+    [appState, adapterState, permissionDenied, notice, devices, device, rssi, demo, demoScenario, isRecording, scan, select, disconnect, startDemo, stopDemo, startSet, endSet, cancelSet]
   );
 
   return (
